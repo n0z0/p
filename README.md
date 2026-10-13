@@ -224,7 +224,7 @@ Biner tunggal akan dihasilkan di `target/release/p` (atau `target/release/p.exe`
 
 ### 2. Membuat Pasangan Kunci 25519
 ```bash
-./target/release/p keygen
+p keygen
 ```
 Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex).
 
@@ -233,10 +233,10 @@ Cukup jalankan `p` tanpa argumen! Aplikasi otomatis berjalan sebagai daemon/serv
 
 ```bash
 # Otomatis: host key dibuat persisten di ~/.p/agent.key, pairing token di ~/.p/agent.token
-./target/release/p
+p
 
 # Atau tentukan port kustom jika diinginkan:
-./target/release/p -p 8080
+p -p 8080
 
 # Output saat Agent berjalan:
 # 🔑 Kunci Host Agent Persisten (~/.p/agent.key)
@@ -251,7 +251,7 @@ Cukup tentukan alamat target (misal `1.2.3.4:9999`), dan `p` otomatis bertindak 
 
 ```bash
 # Masuk ke Interactive Shell (seperti SSH):
-./target/release/p 1.2.3.4:9999
+p 1.2.3.4:9999
 ```
 
 Tampilan interaktif:
@@ -293,27 +293,27 @@ p[1.2.3.4:9999]> exit
 #### Menjalankan Perintah Sekali Jalan (Non-Interactive / Scripting):
 ```bash
 # Mount File Explorer Windows Drive (P:)
-./target/release/p 1.2.3.4:9999 mount P:
+p 1.2.3.4:9999 mount P:
 
 # Cek Statistik
-./target/release/p 1.2.3.4:9999 stats
+p 1.2.3.4:9999 stats
 
 # Eksekusi Terminal
-./target/release/p 1.2.3.4:9999 exec "systemctl status nginx"
+p 1.2.3.4:9999 exec "systemctl status nginx"
 
 # Upload & Download File
-./target/release/p 1.2.3.4:9999 upload ./file.zip
-./target/release/p 1.2.3.4:9999 download /var/log/syslog ./syslog.log
+p 1.2.3.4:9999 upload ./file.zip
+p 1.2.3.4:9999 download /var/log/syslog ./syslog.log
 
 # Rotasi Kunci Sesi
-./target/release/p 1.2.3.4:9999 rekey
+p 1.2.3.4:9999 rekey
 
 # Port Forwarding
-./target/release/p 1.2.3.4:9999 forward-local -L 8080:80
-./target/release/p 1.2.3.4:9999 forward-remote -R 9090:8080
+p 1.2.3.4:9999 forward-local -L 8080:80
+p 1.2.3.4:9999 forward-remote -R 9090:8080
 
 # Matikan Perangkat
-./target/release/p 1.2.3.4:9999 shutdown
+p 1.2.3.4:9999 shutdown
 ```
 
 ---
@@ -324,16 +324,16 @@ Jika Server/Target berada di balik **NAT ketat, Firewall, atau Modem Seluler/4G*
 1. **Di Laptop/Server Admin (yang dapat menerima koneksi masuk):**
    ```bash
    # Buka listener menunggu sambungan dari Agent:
-   ./target/release/p -R
+   p -R
 
    # Atau tentukan port spesifik jika diinginkan:
-   ./target/release/p -R -p 9999
+   p -R -p 9999
    ```
 
 2. **Di Server/Target (Agent):**
    ```bash
    # Agent menembus firewall dan menghubung balik ke Laptop Admin:
-   ./target/release/p <IP_LAPTOP_ADMIN>:9999 -R
+   p <IP_LAPTOP_ADMIN>:9999 -R
    ```
    *Fitur **Exponential Backoff Auto-Reconnect** bawaan `p` otomatis aktif, sehingga jika koneksi internet terputus, Agent akan terus mencoba terhubung kembali.*
 
