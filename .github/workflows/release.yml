@@ -60,7 +60,7 @@ jobs:
             archive_ext: 'tar.gz'
 
           # macOS Intel x86_64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             use_cross: false
             bin_ext: ''
