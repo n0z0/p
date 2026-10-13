@@ -13,10 +13,14 @@ pub enum RemoteCommand {
     // Fitur Pemutaran Kunci (Key Rotation)
     RequestKeyRotation,
 
-    // Fitur Multiplexed Port Forwarding
+    // Fitur Multiplexed Port Forwarding (Local & Remote)
     OpenForwardChannel { channel_id: u32, target_port: u16 },
     ForwardData { channel_id: u32, data: Vec<u8> },
     CloseForwardChannel { channel_id: u32 },
+
+    // Remote Port Forwarding (-R: Agent Listener -> Controller Target)
+    StartRemoteForward { bind_port: u16, target_controller_port: u16 },
+    StopRemoteForward { bind_port: u16 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -29,6 +33,11 @@ pub enum CommandResponse {
     // Respons Port Forwarding
     ForwardChannelAck { channel_id: u32, opened: bool },
     ForwardDataInbound { channel_id: u32, data: Vec<u8> },
+
+    // Respons Remote Port Forwarding (-R)
+    RemoteForwardAck { bind_port: u16, success: bool, message: String },
+    RemoteChannelOpened { channel_id: u32, target_port: u16 },
+    RemoteChannelClosed { channel_id: u32 },
 
     ExecutionError(String),
 }

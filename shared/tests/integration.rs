@@ -298,3 +298,142 @@ async fn test_multiplexed_port_forwarding() {
 
     agent_handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_remote_port_forwarding() {
+    let agent_keypair = generate_keypair().unwrap();
+    let controller_keypair = generate_keypair().unwrap();
+
+    // 1. Controller local app (e.g. echo service on Controller)
+    let controller_app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let controller_app_port = controller_app.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = controller_app.accept().await {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 { break; }
+                let _ = stream.write_all(&buf[..n]).await;
+            }
+        }
+    });
+
+    // 2. Main noise connection
+    let main_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let main_addr = main_listener.local_addr().unwrap();
+
+    let agent_priv = agent_keypair.private.clone();
+    let agent_pub = agent_keypair.public.clone();
+    let controller_priv = controller_keypair.private.clone();
+
+    // 3. Agent handler simulating Remote Forwarding
+    let agent_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let agent_bound_port = agent_listener.local_addr().unwrap().port();
+
+    let agent_handle = tokio::spawn(async move {
+        let (stream, _) = main_listener.accept().await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv).await.unwrap();
+
+        // Expect StartRemoteForward
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::StartRemoteForward { bind_port, target_controller_port } => {
+                assert_eq!(target_controller_port, controller_app_port);
+                framed.send_response(&CommandResponse::RemoteForwardAck {
+                    bind_port,
+                    success: true,
+                    message: "Listening OK".to_string(),
+                }).await.unwrap();
+            }
+            _ => panic!("Expected StartRemoteForward"),
+        }
+
+        // Simulating client connecting to Agent's listener
+        let (mut client_stream, _) = agent_listener.accept().await.unwrap();
+        let channel_id = 999u32;
+
+        framed.send_response(&CommandResponse::RemoteChannelOpened {
+            channel_id,
+            target_port: controller_app_port,
+        }).await.unwrap();
+
+        // Read from client and forward to Controller
+        let mut client_buf = [0u8; 1024];
+        let n = client_stream.read(&mut client_buf).await.unwrap();
+        framed.send_response(&CommandResponse::ForwardDataInbound {
+            channel_id,
+            data: client_buf[..n].to_vec(),
+        }).await.unwrap();
+
+        // Receive response from Controller
+        let fwd_cmd = framed.recv_command().await.unwrap();
+        match fwd_cmd {
+            RemoteCommand::ForwardData { channel_id: cid, data } => {
+                assert_eq!(cid, channel_id);
+                client_stream.write_all(&data).await.unwrap();
+            }
+            _ => panic!("Expected ForwardData"),
+        }
+    });
+
+    // 4. Controller connection
+    let mut controller = NoiseFramedStream::connect_as_initiator(
+        &main_addr.to_string(),
+        &controller_priv,
+        &agent_pub,
+    ).await.unwrap();
+
+    // Request Agent to bind agent_bound_port
+    controller.send_command(&RemoteCommand::StartRemoteForward {
+        bind_port: agent_bound_port,
+        target_controller_port: controller_app_port,
+    }).await.unwrap();
+
+    let ack = controller.recv_response().await.unwrap();
+    match ack {
+        CommandResponse::RemoteForwardAck { success, .. } => assert!(success),
+        _ => panic!("Expected RemoteForwardAck"),
+    }
+
+    // 5. Simulate client at Agent sending data to agent_bound_port
+    let client_task = tokio::spawn(async move {
+        let mut client = TcpStream::connect(format!("127.0.0.1:{}", agent_bound_port)).await.unwrap();
+        client.write_all(b"PING REVERSE TUNNEL").await.unwrap();
+        let mut resp_buf = [0u8; 1024];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        assert_eq!(&resp_buf[..n], b"PING REVERSE TUNNEL");
+    });
+
+    // 6. Controller handles RemoteChannelOpened and bridges to controller_app
+    let chan_msg = controller.recv_response().await.unwrap();
+    let (channel_id, target_port) = match chan_msg {
+        CommandResponse::RemoteChannelOpened { channel_id, target_port } => (channel_id, target_port),
+        _ => panic!("Expected RemoteChannelOpened"),
+    };
+    assert_eq!(target_port, controller_app_port);
+
+    // Controller connects to local app
+    let mut local_app_stream = TcpStream::connect(format!("127.0.0.1:{}", target_port)).await.unwrap();
+
+    // Receive data from Agent client
+    let data_msg = controller.recv_response().await.unwrap();
+    match data_msg {
+        CommandResponse::ForwardDataInbound { channel_id: cid, data } => {
+            assert_eq!(cid, channel_id);
+            local_app_stream.write_all(&data).await.unwrap();
+        }
+        _ => panic!("Expected ForwardDataInbound"),
+    }
+
+    // Read echo from controller local app and send back to Agent
+    let mut echo_buf = [0u8; 1024];
+    let n = local_app_stream.read(&mut echo_buf).await.unwrap();
+    controller.send_command(&RemoteCommand::ForwardData {
+        channel_id,
+        data: echo_buf[..n].to_vec(),
+    }).await.unwrap();
+
+    client_task.await.unwrap();
+    agent_handle.await.unwrap();
+}
+

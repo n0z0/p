@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -61,6 +61,13 @@ enum Commands {
     ForwardLocal {
         /// Format forwarding misal 8080:80 (local_port:remote_port)
         #[arg(short = 'L', long)]
+        mapping: String,
+    },
+
+    /// Remote Port Forwarding (-R agent_bind_port:controller_target_port)
+    ForwardRemote {
+        /// Format forwarding misal 9090:8080 (agent_bind_port:controller_target_port)
+        #[arg(short = 'R', long)]
         mapping: String,
     },
 
@@ -340,6 +347,121 @@ async fn main() -> Result<()> {
                                 }
                             }
                         });
+                    }
+                }
+            }
+        }
+
+        Commands::ForwardRemote { mapping } => {
+            let parts: Vec<&str> = mapping.split(':').collect();
+            if parts.len() != 2 {
+                bail!("Format mapping harus berupa 'agent_port:controller_port', contoh: '9090:8080'");
+            }
+            let agent_port: u16 = parts[0].parse().context("Agent port tidak valid")?;
+            let controller_port: u16 = parts[1].parse().context("Controller target port tidak valid")?;
+
+            println!("🔄 Meminta Agent membuka listener port {} untuk diteruskan ke Controller port {}...", agent_port, controller_port);
+
+            stream.send_command(&RemoteCommand::StartRemoteForward {
+                bind_port: agent_port,
+                target_controller_port: controller_port,
+            }).await?;
+
+            let ack = stream.recv_response().await?;
+            match ack {
+                CommandResponse::RemoteForwardAck { success, message, .. } => {
+                    if !success {
+                        bail!("Agent menolak remote port forward: {}", message);
+                    }
+                    println!("✅ Remote Port Forwarding (-R) aktif!");
+                    println!("   Port di Agent        : 127.0.0.1:{}", agent_port);
+                    println!("   Aplikasi Controller  : 127.0.0.1:{}", controller_port);
+                    println!("   Info Listener        : {}", message);
+                    println!("   Klien di Agent dapat membuka http://127.0.0.1:{} untuk mengakses aplikasi lokal Controller.", agent_port);
+                }
+                other => bail!("Respons tidak terduga saat inisiasi remote forward: {:?}", other),
+            }
+
+            let channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
+            let (outbound_tx, mut outbound_rx) = mpsc::channel::<RemoteCommand>(100);
+
+            loop {
+                tokio::select! {
+                    Some(cmd) = outbound_rx.recv() => {
+                        stream.send_command(&cmd).await?;
+                    }
+
+                    resp_res = stream.recv_response() => {
+                        let resp = match resp_res {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!("Koneksi tunnel terputus: {}", e);
+                                break;
+                            }
+                        };
+
+                        match resp {
+                            CommandResponse::RemoteChannelOpened { channel_id, target_port } => {
+                                info!("Koneksi masuk di Agent! Membuka koneksi lokal ke 127.0.0.1:{} (channel_id={})", target_port, channel_id);
+                                let outbound_tx_clone = outbound_tx.clone();
+                                let channels_clone = channels.clone();
+
+                                match TcpStream::connect(format!("127.0.0.1:{}", target_port)).await {
+                                    Ok(local_stream) => {
+                                        let (mut local_reader, mut local_writer) = local_stream.into_split();
+                                        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(100);
+                                        channels_clone.lock().await.insert(channel_id, data_tx);
+
+                                        // Task: baca dari aplikasi lokal Controller dan kirim ForwardData ke Agent
+                                        tokio::spawn(async move {
+                                            let mut buf = vec![0u8; 16384];
+                                            loop {
+                                                match local_reader.read(&mut buf).await {
+                                                    Ok(0) => break,
+                                                    Ok(n) => {
+                                                        let data = buf[..n].to_vec();
+                                                        if outbound_tx_clone.send(RemoteCommand::ForwardData { channel_id, data }).await.is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                            let _ = outbound_tx_clone.send(RemoteCommand::CloseForwardChannel { channel_id }).await;
+                                        });
+
+                                        // Task: terima data dari Agent dan tulis ke aplikasi lokal Controller
+                                        tokio::spawn(async move {
+                                            while let Some(chunk) = data_rx.recv().await {
+                                                if local_writer.write_all(&chunk).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!("Gagal membuka koneksi ke aplikasi Controller di port {}: {}", target_port, e);
+                                        let _ = outbound_tx.send(RemoteCommand::CloseForwardChannel { channel_id }).await;
+                                    }
+                                }
+                            }
+
+                            CommandResponse::ForwardDataInbound { channel_id, data } => {
+                                let sender = {
+                                    channels.lock().await.get(&channel_id).cloned()
+                                };
+                                if let Some(s) = sender {
+                                    let _ = s.send(data).await;
+                                }
+                            }
+
+                            CommandResponse::RemoteChannelClosed { channel_id } => {
+                                info!("Remote channel {} ditutup oleh Agent", channel_id);
+                                channels.lock().await.remove(&channel_id);
+                            }
+
+                            _ => ()
+                        }
                     }
                 }
             }

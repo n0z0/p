@@ -226,7 +226,12 @@ Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex)
 ./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> rekey
 
 # Local Port Forwarding Multiplexed (SSH -L 8080:80)
+# Membuka layanan remote di Agent (port 80) agar bisa diakses di laptop Controller (port 8080)
 ./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-local -L 8080:80
+
+# Remote Port Forwarding Multiplexed (SSH -R 9090:8080)
+# Membuka aplikasi lokal di Controller (port 8080) agar bisa diakses dari sisi Agent (port 9090)
+./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-remote -R 9090:8080
 ```
 
 ---
@@ -236,6 +241,7 @@ Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex)
 - [x] **Handshake Awal:** Selesai menggunakan `snow` (`Noise_IK_25519_ChaChaPoly_BLAKE2b`) di atas `tokio::net::TcpStream`.
 - [x] **Stream Framed:** Pembungkus `NoiseFramedStream` memanfaatkan `tokio_util::codec::LengthDelimitedCodec` untuk mencegah fragmentasi data.
 - [x] **Auto-Reconnect Loop:** Modul resiliensi jaringan dengan strategi *Exponential Backoff* (1s - 60s) pada Agent.
-- [x] **Multiplexed Port Forwarding:** Aliran multi-channel (`channel_id`) menggunakan `HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>` yang menumpang di satu koneksi Raw TCP.
-- [x] **Kompilasi Silang & Docker:** Dikonfigurasi via `Cross.toml`, `Dockerfile`, serta GitHub Actions Multi-OS workflow.
+- [x] **Local Port Forwarding (-L):** Aliran multi-channel (`channel_id`) menggunakan `HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>` yang menumpang di satu koneksi Raw TCP.
+- [x] **Remote Port Forwarding (-R / Reverse Tunneling):** Membuka layanan/aplikasi internal Controller agar dapat diakses langsung oleh perangkat/klien di sisi Agent melalui tunnel terenkripsi Noise.
+- [x] **Kompilasi Silang & Docker:** Dikonfigurasi via `Dockerfile` serta GitHub Actions Multi-OS workflow untuk Windows, Linux, dan macOS.
 

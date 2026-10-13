@@ -185,6 +185,7 @@ async fn handle_session(
     key_rotation_bytes: u64,
 ) -> Result<()> {
     let channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let remote_listeners: Arc<Mutex<HashMap<u16, tokio::sync::oneshot::Sender<()>>>> = Arc::new(Mutex::new(HashMap::new()));
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<CommandResponse>(128);
 
     let mut current_file: Option<FileTransferState> = None;
@@ -370,6 +371,115 @@ async fn handle_session(
                     RemoteCommand::CloseForwardChannel { channel_id } => {
                         info!("Menutup forward channel {}", channel_id);
                         channels.lock().await.remove(&channel_id);
+                    }
+
+                    RemoteCommand::StartRemoteForward { bind_port, target_controller_port } => {
+                        info!("🔀 Membuka remote forward listener di port {} (target controller port {})", bind_port, target_controller_port);
+                        
+                        let bind_res = match TcpListener::bind(format!("0.0.0.0:{}", bind_port)).await {
+                            Ok(l) => Ok(l),
+                            Err(_) => TcpListener::bind(format!("127.0.0.1:{}", bind_port)).await,
+                        };
+
+                        match bind_res {
+                            Ok(listener) => {
+                                info!("✅ Remote forward listening di port {}", bind_port);
+                                stream.send_response(&CommandResponse::RemoteForwardAck {
+                                    bind_port,
+                                    success: true,
+                                    message: format!("Listening on port {}", bind_port),
+                                }).await?;
+
+                                let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+                                remote_listeners.lock().await.insert(bind_port, stop_tx);
+
+                                let outbound_tx_listener = outbound_tx.clone();
+                                let channels_listener = channels.clone();
+
+                                tokio::spawn(async move {
+                                    static REMOTE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x8000_0000);
+                                    loop {
+                                        tokio::select! {
+                                            _ = &mut stop_rx => {
+                                                info!("Remote listener port {} dimatikan", bind_port);
+                                                break;
+                                            }
+                                            accept_res = listener.accept() => {
+                                                let (client_stream, client_addr) = match accept_res {
+                                                    Ok(res) => res,
+                                                    Err(e) => {
+                                                        warn!("Gagal menerima koneksi di port {}: {}", bind_port, e);
+                                                        break;
+                                                    }
+                                                };
+
+                                                let channel_id = REMOTE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                                info!("Koneksi remote baru di Agent port {} dari {}: channel_id={}", bind_port, client_addr, channel_id);
+
+                                                let (mut client_reader, mut client_writer) = client_stream.into_split();
+                                                let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(100);
+                                                channels_listener.lock().await.insert(channel_id, data_tx);
+
+                                                if outbound_tx_listener.send(CommandResponse::RemoteChannelOpened {
+                                                    channel_id,
+                                                    target_port: target_controller_port,
+                                                }).await.is_err() {
+                                                    break;
+                                                }
+
+                                                // Task tulis data dari Controller ke client remote di Agent
+                                                tokio::spawn(async move {
+                                                    while let Some(chunk) = data_rx.recv().await {
+                                                        if client_writer.write_all(&chunk).await.is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                });
+
+                                                // Task baca data dari client remote di Agent lalu kirim ke Controller
+                                                let outbound_tx_stream = outbound_tx_listener.clone();
+                                                let channels_cleanup = channels_listener.clone();
+                                                tokio::spawn(async move {
+                                                    let mut buf = vec![0u8; 16384];
+                                                    loop {
+                                                        match client_reader.read(&mut buf).await {
+                                                            Ok(0) => break,
+                                                            Ok(n) => {
+                                                                let data = buf[..n].to_vec();
+                                                                if outbound_tx_stream.send(CommandResponse::ForwardDataInbound {
+                                                                    channel_id,
+                                                                    data,
+                                                                }).await.is_err() {
+                                                                    break;
+                                                                }
+                                                            }
+                                                            Err(_) => break,
+                                                        }
+                                                    }
+                                                    channels_cleanup.lock().await.remove(&channel_id);
+                                                    let _ = outbound_tx_stream.send(CommandResponse::RemoteChannelClosed { channel_id }).await;
+                                                });
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!("Gagal bind remote forward port {}: {}", bind_port, e);
+                                stream.send_response(&CommandResponse::RemoteForwardAck {
+                                    bind_port,
+                                    success: false,
+                                    message: format!("Gagal bind port {}: {}", bind_port, e),
+                                }).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::StopRemoteForward { bind_port } => {
+                        info!("🛑 Menghentikan remote forward listener di port {}", bind_port);
+                        if let Some(stop_tx) = remote_listeners.lock().await.remove(&bind_port) {
+                            let _ = stop_tx.send(());
+                        }
                     }
                 }
             }
