@@ -10,7 +10,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
-use crate::crypto::{compute_key_fingerprint, load_or_create_agent_key};
+use crate::crypto::{
+    add_authorized_controller, compute_key_fingerprint, is_controller_authorized,
+    load_or_create_agent_key, load_or_create_agent_token,
+};
 use crate::framed::NoiseFramedStream;
 use crate::os::{execute_os_command, get_system_stats, shutdown_system};
 use crate::protocol::{CommandResponse, RemoteCommand};
@@ -28,6 +31,10 @@ pub struct AgentArgs {
     /// Kunci privat statis dalam format heksadesimal (32-byte). Jika kosong, kunci persisten ~/.p/agent.key akan digunakan
     #[arg(short, long)]
     pub privkey: Option<String>,
+
+    /// Token rahasia / Password untuk otorisasi Controller (pairing pertama kali)
+    #[arg(short, long)]
+    pub token: Option<String>,
 
     /// Folder penyimpanan file yang diterima
     #[arg(short, long, default_value = "./storage")]
@@ -74,12 +81,23 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         }
     };
 
+    let pairing_token = match &args.token {
+        Some(t) => t.trim().to_string(),
+        None => load_or_create_agent_token(),
+    };
+    println!("🔐 AGENT PAIRING TOKEN (Password Otorisasi Controller):");
+    println!("   Token       : {}", pairing_token);
+    println!("   Petunjuk    : Masukkan token ini ketika Controller pertama kali menghubung!");
+    println!("   Keamanan    : Controller yang berhasil pairing dicatat di ~/.p/authorized_controllers");
+    println!();
+    let pairing_token = Arc::new(pairing_token);
+
     match args.mode.to_lowercase().as_str() {
         "listen" => {
-            run_listen_loop(&args, &privkey_bytes, &pubkey_bytes).await?;
+            run_listen_loop(&args, &privkey_bytes, &pubkey_bytes, pairing_token).await?;
         }
         "connect" => {
-            run_reconnect_loop(&args, &privkey_bytes, &pubkey_bytes).await?;
+            run_reconnect_loop(&args, &privkey_bytes, &pubkey_bytes, pairing_token).await?;
         }
         other => {
             bail!("Mode tidak dikenal '{}'. Gunakan 'listen' atau 'connect'.", other);
@@ -89,7 +107,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_listen_loop(args: &AgentArgs, privkey: &[u8], pubkey: &[u8]) -> Result<()> {
+async fn run_listen_loop(
+    args: &AgentArgs,
+    privkey: &[u8],
+    pubkey: &[u8],
+    pairing_token: Arc<String>,
+) -> Result<()> {
     let listener = TcpListener::bind(&args.addr)
         .await
         .with_context(|| format!("Gagal bind ke {}", args.addr))?;
@@ -105,12 +128,13 @@ async fn run_listen_loop(args: &AgentArgs, privkey: &[u8], pubkey: &[u8]) -> Res
                 let storage_dir = args.storage_dir.clone();
                 let rot_secs = args.key_rotation_secs;
                 let rot_bytes = args.key_rotation_bytes;
+                let token_clone = pairing_token.clone();
 
                 tokio::spawn(async move {
                     match NoiseFramedStream::accept_as_responder(stream, &privkey_clone, &pubkey_clone).await {
                         Ok(framed) => {
                             info!("🔒 Handshake Noise IK sukses dengan {}", peer_addr);
-                            if let Err(e) = handle_session(framed, storage_dir, rot_secs, rot_bytes).await {
+                            if let Err(e) = handle_session(framed, storage_dir, rot_secs, rot_bytes, token_clone).await {
                                 warn!("⚠️ Sesi terputus dengan {}: {}", peer_addr, e);
                             }
                         }
@@ -128,7 +152,12 @@ async fn run_listen_loop(args: &AgentArgs, privkey: &[u8], pubkey: &[u8]) -> Res
     }
 }
 
-async fn run_reconnect_loop(args: &AgentArgs, privkey: &[u8], pubkey: &[u8]) -> Result<()> {
+async fn run_reconnect_loop(
+    args: &AgentArgs,
+    privkey: &[u8],
+    pubkey: &[u8],
+    pairing_token: Arc<String>,
+) -> Result<()> {
     let mut backoff = 1u64;
     let max_backoff = 60u64;
 
@@ -146,6 +175,7 @@ async fn run_reconnect_loop(args: &AgentArgs, privkey: &[u8], pubkey: &[u8]) -> 
                             args.storage_dir.clone(),
                             args.key_rotation_secs,
                             args.key_rotation_bytes,
+                            pairing_token.clone(),
                         )
                         .await
                         {
@@ -173,7 +203,53 @@ async fn handle_session(
     storage_dir: PathBuf,
     key_rotation_secs: u64,
     key_rotation_bytes: u64,
+    pairing_token: Arc<String>,
 ) -> Result<()> {
+    // 1. Verifikasi Otorisasi Controller
+    let remote_pubkey_opt = stream.get_remote_static().map(|k| k.to_vec());
+    let is_authorized = match &remote_pubkey_opt {
+        Some(k) => is_controller_authorized(k),
+        None => false,
+    };
+
+    if is_authorized {
+        info!("🔑 Controller terotorisasi (ada di ~/.p/authorized_controllers).");
+        stream.send_response(&CommandResponse::AuthSuccess).await?;
+    } else {
+        info!("🔒 Controller baru/belum terdaftar. Mengirim AuthChallenge...");
+        stream.send_response(&CommandResponse::AuthChallenge).await?;
+
+        let first_cmd = match stream.recv_command().await {
+            Ok(c) => c,
+            Err(e) => {
+                info!("Controller memutus koneksi saat ditantang autentikasi: {}", e);
+                return Ok(());
+            }
+        };
+
+        match first_cmd {
+            RemoteCommand::Authenticate { token } => {
+                if token.trim() == pairing_token.as_str() {
+                    if let Some(ref k) = remote_pubkey_opt {
+                        if let Err(e) = add_authorized_controller(k, Some("paired-controller")) {
+                            warn!("Gagal menyimpan authorized_controller: {}", e);
+                        }
+                    }
+                    info!("✅ Pairing Controller berhasil! Public key disimpan ke ~/.p/authorized_controllers");
+                    stream.send_response(&CommandResponse::AuthSuccess).await?;
+                } else {
+                    warn!("❌ Token autentikasi dari Controller salah!");
+                    let _ = stream.send_response(&CommandResponse::AuthFailed("Password / Pairing Token salah!".into())).await;
+                    bail!("Autentikasi Controller gagal: token salah.");
+                }
+            }
+            _ => {
+                warn!("Controller mengirim perintah tanpa autentikasi!");
+                let _ = stream.send_response(&CommandResponse::AuthFailed("Autentikasi dibutuhkan terlebih dahulu!".into())).await;
+                bail!("Controller tidak terautentikasi.");
+            }
+        }
+    }
     let channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let remote_listeners: Arc<Mutex<HashMap<u16, tokio::sync::oneshot::Sender<()>>>> = Arc::new(Mutex::new(HashMap::new()));
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<CommandResponse>(128);
@@ -204,6 +280,10 @@ async fn handle_session(
                 };
 
                 match cmd {
+                    RemoteCommand::Authenticate { .. } => {
+                        stream.send_response(&CommandResponse::AuthSuccess).await?;
+                    }
+
                     RemoteCommand::RunTerminal(command_str) => {
                         info!("💻 Menjalankan perintah terminal: {}", command_str);
                         let (stdout, stderr) = match execute_os_command(&command_str) {

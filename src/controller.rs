@@ -18,9 +18,17 @@ use crate::protocol::{CommandResponse, RemoteCommand};
 
 #[derive(Args, Debug, Clone)]
 pub struct ControllerArgs {
-    /// Alamat Target Agent (default: 127.0.0.1:9999)
-    #[arg(short, long, default_value = "127.0.0.1:9999")]
-    pub addr: String,
+    /// Alamat Target Agent (contoh: 127.0.0.1:9999). Bisa posisi langsung: 'p controller 127.0.0.1:9999'
+    #[arg(value_name = "TARGET_ADDR")]
+    pub addr_pos: Option<String>,
+
+    /// Alamat Target Agent via flag -a / --addr
+    #[arg(short, long)]
+    pub addr: Option<String>,
+
+    /// Token rahasia / Password untuk otorisasi (pairing pertama kali)
+    #[arg(short, long)]
+    pub token: Option<String>,
 
     /// Kunci privat statis Controller (32-byte hex). Jika kosong, kunci persisten ~/.p/controller.key digunakan
     #[arg(long)]
@@ -31,11 +39,14 @@ pub struct ControllerArgs {
     pub agent_pubkey: Option<String>,
 
     #[command(subcommand)]
-    pub command: ControllerCommand,
+    pub command: Option<ControllerCommand>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum ControllerCommand {
+    /// Masuk ke sesi interaktif remote shell (SSH-style REPL)
+    Shell,
+
     /// Menjalankan perintah terminal di Agent
     Exec {
         /// Perintah terminal yang ingin dieksekusi
@@ -82,29 +93,327 @@ pub enum ControllerCommand {
 
 const CHUNK_SIZE: usize = 32 * 1024; // 32 KB per chunk
 
+async fn perform_upload(stream: &mut NoiseFramedStream, filepath: PathBuf) -> Result<()> {
+    let mut file = File::open(&filepath)
+        .await
+        .with_context(|| format!("Gagal membuka file lokal: {}", filepath.display()))?;
+
+    let metadata = file.metadata().await?;
+    let file_size = metadata.len();
+    let total_chunks = ((file_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as u32;
+
+    let filename = filepath
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    println!("📤 Mengunggah file '{}' ({} byte, {} chunks)...", filename, file_size, total_chunks);
+
+    stream
+        .send_command(&RemoteCommand::StartFileTransfer {
+            filename: filename.clone(),
+            total_chunks,
+        })
+        .await?;
+
+    let ack = stream.recv_response().await?;
+    match ack {
+        CommandResponse::FileChunkAck { success: true, .. } => (),
+        _ => bail!("Agent menolak inisialisasi transfer file!"),
+    }
+
+    let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+    let mut chunk_idx = 0u32;
+
+    loop {
+        let n = file.read(&mut chunk_buf).await?;
+        if n == 0 {
+            break;
+        }
+        let data = chunk_buf[..n].to_vec();
+
+        stream
+            .send_command(&RemoteCommand::WriteFileChunk {
+                chunk_index: chunk_idx,
+                data,
+            })
+            .await?;
+
+        let res = stream.recv_response().await?;
+        match res {
+            CommandResponse::FileChunkAck { chunk_index, success } => {
+                if !success {
+                    bail!("Agent gagal menyimpan chunk {}", chunk_index);
+                }
+            }
+            _ => bail!("Respons tak terduga saat chunk ack: {:?}", res),
+        }
+
+        chunk_idx += 1;
+        let percent = (chunk_idx as f32 / total_chunks as f32) * 100.0;
+        print!("\r⏳ Mengirim: chunk {}/{} ({:.1}%)", chunk_idx, total_chunks, percent);
+    }
+
+    println!("\n✅ File berhasil diunggah secara utuh!");
+    Ok(())
+}
+
+async fn perform_download(
+    stream: &mut NoiseFramedStream,
+    remote_path: String,
+    local_path: PathBuf,
+) -> Result<()> {
+    println!("📥 Meminta unduh file '{}' dari Agent...", remote_path);
+    stream
+        .send_command(&RemoteCommand::StartDownload {
+            filepath: remote_path.clone(),
+        })
+        .await?;
+
+    let header_resp = stream.recv_response().await?;
+    let (filename, total_chunks, file_size) = match header_resp {
+        CommandResponse::DownloadHeader {
+            filename,
+            total_chunks,
+            file_size,
+        } => (filename, total_chunks, file_size),
+        CommandResponse::DownloadError(err) => {
+            bail!("Agent menolak permintaan unduh: {}", err);
+        }
+        other => bail!("Respons tak terduga saat inisiasi unduh: {:?}", other),
+    };
+
+    let target_path = if local_path.is_dir() {
+        local_path.join(&filename)
+    } else {
+        local_path
+    };
+
+    if let Some(parent) = target_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+    }
+
+    let mut dest_file = File::create(&target_path)
+        .await
+        .with_context(|| format!("Gagal membuat file lokal: {}", target_path.display()))?;
+
+    println!(
+        "📥 Mengunduh file '{}' ({} byte, {} chunks)...",
+        filename, file_size, total_chunks
+    );
+
+    for chunk_idx in 0..total_chunks {
+        stream
+            .send_command(&RemoteCommand::RequestDownloadChunk {
+                chunk_index: chunk_idx,
+            })
+            .await?;
+
+        let chunk_resp = stream.recv_response().await?;
+        match chunk_resp {
+            CommandResponse::DownloadChunk {
+                chunk_index,
+                data,
+            } => {
+                if chunk_index != chunk_idx {
+                    bail!(
+                        "Indeks chunk tidak cocok: diharapkan {}, diterima {}",
+                        chunk_idx,
+                        chunk_index
+                    );
+                }
+                dest_file.write_all(&data).await?;
+            }
+            CommandResponse::DownloadError(err) => {
+                bail!("Error saat mengunduh chunk {}: {}", chunk_idx, err);
+            }
+            other => bail!("Respons tak terduga saat meminta chunk {}: {:?}", chunk_idx, other),
+        }
+
+        let percent = ((chunk_idx + 1) as f32 / total_chunks as f32) * 100.0;
+        print!(
+            "\r⏳ Mengunduh: chunk {}/{} ({:.1}%)",
+            chunk_idx + 1,
+            total_chunks,
+            percent
+        );
+    }
+
+    dest_file.flush().await?;
+    println!("\n✅ File berhasil diunduh ke: {}", target_path.display());
+    Ok(())
+}
+
+async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Result<()> {
+    use std::io::{self, Write};
+
+    println!("══════════════════════════════════════════════════════════");
+    println!("💻 SESI INTERAKTIF REMOTE SHELL (p controller)");
+    println!("   Target Host : {}", addr);
+    println!("   Bantuan     : Ketik 'help' untuk daftar perintah khusus");
+    println!("   Keluar      : Ketik 'exit' atau tekan Ctrl+C");
+    println!("══════════════════════════════════════════════════════════");
+
+    let stdin = io::stdin();
+    loop {
+        print!("p[{}]> ", addr);
+        let _ = io::stdout().flush();
+
+        let mut input_line = String::new();
+        let bytes_read = match stdin.read_line(&mut input_line) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+
+        if bytes_read == 0 {
+            // EOF
+            println!();
+            break;
+        }
+
+        let trimmed = input_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed == "exit" || trimmed == "quit" {
+            println!("👋 Sesi remote shell ditutup.");
+            break;
+        }
+
+        if trimmed == "help" {
+            println!("📋 Perintah Bawaan:");
+            println!("   stats                      - Cek beban CPU & RAM di Agent");
+            println!("   upload <local_file>        - Unggah file lokal ke Agent");
+            println!("   download <remote> [local]  - Unduh file dari Agent ke lokal");
+            println!("   rekey                      - Rotasi kunci sesi enkripsi Noise");
+            println!("   clear / cls                - Bersihkan layar");
+            println!("   exit / quit                - Keluar dari remote shell");
+            println!("💡 Semua perintah lainnya akan langsung dieksekusi di OS Agent.");
+            continue;
+        }
+
+        if trimmed == "clear" || trimmed == "cls" {
+            print!("\x1B[2J\x1B[1;1H");
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        if trimmed == "stats" {
+            stream.send_command(&RemoteCommand::GetSystemStats).await?;
+            if let Ok(resp) = stream.recv_response().await {
+                match resp {
+                    CommandResponse::SystemStats { cpu_usage, ram_used_mb } => {
+                        println!("📊 CPU: {:.2}% | RAM: {} MB", cpu_usage, ram_used_mb);
+                    }
+                    other => println!("{:?}", other),
+                }
+            }
+            continue;
+        }
+
+        if trimmed == "rekey" {
+            println!("🔄 Memutar kunci sesi simetris...");
+            stream.send_command(&RemoteCommand::RequestKeyRotation).await?;
+            let _ = stream.rekey();
+            if let Ok(resp) = stream.recv_response().await {
+                match resp {
+                    CommandResponse::KeyRotationReady => {
+                        println!("✅ Rotasi kunci sesi berhasil!");
+                    }
+                    other => println!("{:?}", other),
+                }
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("upload ") {
+            let path_arg = trimmed[7..].trim();
+            if path_arg.is_empty() {
+                println!("⚠️ Format: upload <path_file_lokal>");
+            } else if let Err(e) = perform_upload(stream, PathBuf::from(path_arg)).await {
+                eprintln!("❌ Upload gagal: {}", e);
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("download ") {
+            let parts: Vec<&str> = trimmed[9..].split_whitespace().collect();
+            if parts.is_empty() {
+                println!("⚠️ Format: download <remote_path> [local_path]");
+                continue;
+            }
+            let remote = parts[0].to_string();
+            let local = if parts.len() > 1 {
+                PathBuf::from(parts[1])
+            } else {
+                let default_name = std::path::Path::new(&remote).file_name().unwrap_or_default();
+                PathBuf::from(default_name)
+            };
+            if let Err(e) = perform_download(stream, remote, local).await {
+                eprintln!("❌ Download gagal: {}", e);
+            }
+            continue;
+        }
+
+        // Jalankan perintah terminal biasa di Agent
+        stream.send_command(&RemoteCommand::RunTerminal(trimmed.to_string())).await?;
+        match stream.recv_response().await {
+            Ok(CommandResponse::TerminalOutput { stdout, stderr }) => {
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                    let _ = io::stdout().flush();
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                    let _ = io::stderr().flush();
+                }
+            }
+            Ok(CommandResponse::ExecutionError(err)) => {
+                eprintln!("❌ Error eksekusi: {}", err);
+            }
+            Ok(other) => println!("Respons: {:?}", other),
+            Err(e) => {
+                eprintln!("⚠️ Koneksi terputus: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn run_controller(args: ControllerArgs) -> Result<()> {
+    let target_addr = args
+        .addr
+        .or(args.addr_pos)
+        .unwrap_or_else(|| "127.0.0.1:9999".into());
+
     let agent_pubkey_bytes = if let Some(hex_str) = &args.agent_pubkey {
         let bytes = hex::decode(hex_str.trim()).context("Format hex agent_pubkey tidak valid")?;
         if bytes.len() != 32 {
             bail!("Panjang agent_pubkey harus 32 byte!");
         }
         bytes
-    } else if let Some(saved_key) = lookup_known_agent(&args.addr) {
-        info!("🔑 Kunci publik Agent ditemukan di ~/.p/known_agents untuk {}", args.addr);
+    } else if let Some(saved_key) = lookup_known_agent(&target_addr) {
+        info!("🔑 Kunci publik Agent ditemukan di ~/.p/known_agents untuk {}", target_addr);
         saved_key
     } else {
-        println!("🔍 Menghubungi Agent di {} untuk mengambil identitas kunci publik (TOFU)...", args.addr);
-        match NoiseFramedStream::discover_remote_pubkey(&args.addr).await {
+        println!("🔍 Menghubungi Agent di {} untuk mengambil identitas kunci publik (TOFU)...", target_addr);
+        match NoiseFramedStream::discover_remote_pubkey(&target_addr).await {
             Ok(discovered_pubkey) => {
                 let fingerprint = compute_key_fingerprint(&discovered_pubkey);
                 let hex_key = hex::encode(&discovered_pubkey);
                 println!("🔒 KUNCI PUBLIK AGENT TERVERIFIKASI (Trust On First Use):");
-                println!("   Host        : {}", args.addr);
+                println!("   Host        : {}", target_addr);
                 println!("   Fingerprint : {}", fingerprint);
                 println!("   Public Key  : {}", hex_key);
                 println!("💡 Kunci otomatis disimpan ke ~/.p/known_agents (seperti SSH).");
                 println!();
-                if let Err(e) = save_known_agent(&args.addr, &hex_key) {
+                if let Err(e) = save_known_agent(&target_addr, &hex_key) {
                     warn!("Gagal menyimpan ke known_agents: {}", e);
                 }
                 discovered_pubkey
@@ -112,7 +421,7 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
             Err(e) => {
                 bail!(
                     "Gagal mengambil kunci publik otomatis dari Agent di {}: {}. Pastikan Agent sedang berjalan, atau tentukan secara manual via --agent-pubkey.",
-                    args.addr, e
+                    target_addr, e
                 );
             }
         }
@@ -158,18 +467,64 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
         }
     };
 
-    info!("🌐 Menghubungkan ke Agent di {}...", args.addr);
+    info!("🌐 Menghubungkan ke Agent di {}...", target_addr);
     let mut stream = NoiseFramedStream::connect_as_initiator(
-        &args.addr,
+        &target_addr,
         &controller_privkey_bytes,
         &agent_pubkey_bytes,
     )
     .await
     .context("Gagal melakukan handshake terenkripsi Noise ke Agent")?;
 
-    info!("🔒 Terhubung dengan aman ke Agent! Mengirim perintah...");
+    info!("🔒 Terhubung dengan aman ke Agent! Memverifikasi status otorisasi...");
 
-    match args.command {
+    // 2. Alur Autentikasi / Pairing Token
+    let initial_auth = stream.recv_response().await
+        .context("Gagal menerima respons awal status autentikasi dari Agent")?;
+
+    match initial_auth {
+        CommandResponse::AuthSuccess => {
+            info!("🔑 Controller telah terotorisasi otomatis (terdaftar di ~/.p/authorized_controllers Agent).");
+        }
+        CommandResponse::AuthChallenge => {
+            println!("🔒 Agent membutuhkan otorisasi untuk Controller baru.");
+            let token = match args.token {
+                Some(t) => t.trim().to_string(),
+                None => {
+                    use std::io::{self, Write};
+                    print!("🔑 Masukkan Password / Pairing Token: ");
+                    let _ = io::stdout().flush();
+                    let entered = rpassword::read_password()
+                        .context("Gagal membaca password dari input")?;
+                    entered.trim().to_string()
+                }
+            };
+
+            stream.send_command(&RemoteCommand::Authenticate { token }).await?;
+            let auth_res = stream.recv_response().await
+                .context("Gagal menerima hasil verifikasi autentikasi dari Agent")?;
+
+            match auth_res {
+                CommandResponse::AuthSuccess => {
+                    println!("✅ Pairing berhasil! Kunci Controller telah diotorisasi di Agent.");
+                    println!("💡 Pada koneksi berikutnya, Anda tidak perlu memasukkan password lagi!");
+                    println!();
+                }
+                CommandResponse::AuthFailed(reason) => {
+                    bail!("❌ Autentikasi ditolak oleh Agent: {}", reason);
+                }
+                other => bail!("Respons tak terduga saat autentikasi: {:?}", other),
+            }
+        }
+        other => bail!("Respons status awal tidak dikenal dari Agent: {:?}", other),
+    }
+
+    let cmd = args.command.unwrap_or(ControllerCommand::Shell);
+    match cmd {
+        ControllerCommand::Shell => {
+            run_interactive_shell(&mut stream, &target_addr).await?;
+        }
+
         ControllerCommand::Exec { command } => {
             stream.send_command(&RemoteCommand::RunTerminal(command)).await?;
             let resp = stream.recv_response().await?;
@@ -205,151 +560,11 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
         }
 
         ControllerCommand::Upload { filepath } => {
-            let mut file = File::open(&filepath)
-                .await
-                .with_context(|| format!("Gagal membuka file lokal: {}", filepath.display()))?;
-
-            let metadata = file.metadata().await?;
-            let file_size = metadata.len();
-            let total_chunks = ((file_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as u32;
-
-            let filename = filepath
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            println!("📤 Mengunggah file '{}' ({} byte, {} chunks)...", filename, file_size, total_chunks);
-
-            stream
-                .send_command(&RemoteCommand::StartFileTransfer {
-                    filename: filename.clone(),
-                    total_chunks,
-                })
-                .await?;
-
-            let ack = stream.recv_response().await?;
-            match ack {
-                CommandResponse::FileChunkAck { success: true, .. } => (),
-                _ => bail!("Agent menolak inisialisasi transfer file!"),
-            }
-
-            let mut chunk_buf = vec![0u8; CHUNK_SIZE];
-            let mut chunk_idx = 0u32;
-
-            loop {
-                let n = file.read(&mut chunk_buf).await?;
-                if n == 0 {
-                    break;
-                }
-                let data = chunk_buf[..n].to_vec();
-
-                stream
-                    .send_command(&RemoteCommand::WriteFileChunk {
-                        chunk_index: chunk_idx,
-                        data,
-                    })
-                    .await?;
-
-                let res = stream.recv_response().await?;
-                match res {
-                    CommandResponse::FileChunkAck { chunk_index, success } => {
-                        if !success {
-                            bail!("Agent gagal menyimpan chunk {}", chunk_index);
-                        }
-                    }
-                    _ => bail!("Respons tak terduga saat chunk ack: {:?}", res),
-                }
-
-                chunk_idx += 1;
-                let percent = (chunk_idx as f32 / total_chunks as f32) * 100.0;
-                print!("\r⏳ Mengirim: chunk {}/{} ({:.1}%)", chunk_idx, total_chunks, percent);
-            }
-
-            println!("\n✅ File berhasil diunggah secara utuh!");
+            perform_upload(&mut stream, filepath).await?;
         }
 
         ControllerCommand::Download { remote_path, local_path } => {
-            println!("📥 Meminta unduh file '{}' dari Agent...", remote_path);
-            stream
-                .send_command(&RemoteCommand::StartDownload {
-                    filepath: remote_path.clone(),
-                })
-                .await?;
-
-            let header_resp = stream.recv_response().await?;
-            let (filename, total_chunks, file_size) = match header_resp {
-                CommandResponse::DownloadHeader {
-                    filename,
-                    total_chunks,
-                    file_size,
-                } => (filename, total_chunks, file_size),
-                CommandResponse::DownloadError(err) => {
-                    bail!("Agent menolak permintaan unduh: {}", err);
-                }
-                other => bail!("Respons tak terduga saat inisiasi unduh: {:?}", other),
-            };
-
-            let target_path = if local_path.is_dir() {
-                local_path.join(&filename)
-            } else {
-                local_path
-            };
-
-            if let Some(parent) = target_path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-            }
-
-            let mut dest_file = File::create(&target_path)
-                .await
-                .with_context(|| format!("Gagal membuat file lokal: {}", target_path.display()))?;
-
-            println!(
-                "📥 Mengunduh file '{}' ({} byte, {} chunks)...",
-                filename, file_size, total_chunks
-            );
-
-            for chunk_idx in 0..total_chunks {
-                stream
-                    .send_command(&RemoteCommand::RequestDownloadChunk {
-                        chunk_index: chunk_idx,
-                    })
-                    .await?;
-
-                let chunk_resp = stream.recv_response().await?;
-                match chunk_resp {
-                    CommandResponse::DownloadChunk {
-                        chunk_index,
-                        data,
-                    } => {
-                        if chunk_index != chunk_idx {
-                            bail!(
-                                "Indeks chunk tidak cocok: diharapkan {}, diterima {}",
-                                chunk_idx,
-                                chunk_index
-                            );
-                        }
-                        dest_file.write_all(&data).await?;
-                    }
-                    CommandResponse::DownloadError(err) => {
-                        bail!("Error saat mengunduh chunk {}: {}", chunk_idx, err);
-                    }
-                    other => bail!("Respons tak terduga saat meminta chunk {}: {:?}", chunk_idx, other),
-                }
-
-                let percent = ((chunk_idx + 1) as f32 / total_chunks as f32) * 100.0;
-                print!(
-                    "\r⏳ Mengunduh: chunk {}/{} ({:.1}%)",
-                    chunk_idx + 1,
-                    total_chunks,
-                    percent
-                );
-            }
-
-            dest_file.flush().await?;
-            println!("\n✅ File berhasil diunduh ke: {}", target_path.display());
+            perform_download(&mut stream, remote_path, local_path).await?;
         }
 
         ControllerCommand::Rekey => {

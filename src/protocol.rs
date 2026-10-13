@@ -20,6 +20,9 @@ pub enum RemoteCommand {
     ForwardData { channel_id: u32, data: Vec<u8> },
     CloseForwardChannel { channel_id: u32 },
 
+    // Autentikasi / Pairing
+    Authenticate { token: String },
+
     // Remote Port Forwarding (-R: Agent Listener -> Controller Target)
     StartRemoteForward { bind_port: u16, target_controller_port: u16 },
     StopRemoteForward { bind_port: u16 },
@@ -27,6 +30,11 @@ pub enum RemoteCommand {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum CommandResponse {
+    // Autentikasi / Pairing
+    AuthChallenge,
+    AuthSuccess,
+    AuthFailed(String),
+
     TerminalOutput { stdout: String, stderr: String },
     SystemStats { cpu_usage: f32, ram_used_mb: u64 },
     FileChunkAck { chunk_index: u32, success: bool },

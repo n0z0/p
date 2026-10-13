@@ -210,45 +210,75 @@ Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex)
 
 ### 3. Menjalankan Mode Agent (di Server / VPS / IoT)
 ```bash
-# Otomatis: host key dibuat/dimuat persisten di ~/.p/agent.key
-./target/release/p agent --mode listen --addr 0.0.0.0:9999
+# Otomatis: host key dibuat persisten di ~/.p/agent.key, pairing token di ~/.p/agent.token
+./target/release/p agent --addr 0.0.0.0:9999
 
-# Mode Connect (Reverse Connection dengan Auto-Reconnect)
-./target/release/p agent --mode connect --addr 1.2.3.4:9999
-
-# Atau tentukan private key custom manual jika diinginkan
-./target/release/p agent --mode listen --addr 0.0.0.0:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
+# Output saat Agent berjalan:
+# 🔑 Kunci Host Agent Persisten (~/.p/agent.key)
+# 🔐 AGENT PAIRING TOKEN (Password Otorisasi Controller):
+#    Token       : 7f3a-9c12
+#    Petunjuk    : Masukkan token ini ketika Controller pertama kali menghubung!
+#    Keamanan    : Controller yang berhasil pairing dicatat di ~/.p/authorized_controllers
 ```
 
-### 4. Menjalankan Perintah dari Controller (di Laptop / PC Admin)
-> **Fitur SSH-Style TOFU:** Parameter `--agent-pubkey` bersifat **opsional**. Jika diabaikan, Controller otomatis mengunduh kunci publik Agent, memverifikasi fingerprint SHA-256, dan menyimpannya ke `~/.p/known_agents`!
+### 4. Menghubungkan Controller (SSH-Style Interactive REPL Shell)
+Cukup tentukan alamat target, dan Controller akan meminta password (hanya saat pairing pertama kali), lalu langsung membuka prompt remote shell interaktif:
 
 ```bash
-# Mengambil Statistik Remote (CPU & RAM)
-./target/release/p controller --addr 1.2.3.4:9999 stats
+# Masuk ke Interactive Shell (seperti SSH)
+./target/release/p controller 1.2.3.4:9999
+```
 
-# Eksekusi Perintah Terminal OS Jarak Jauh
-./target/release/p controller --addr 1.2.3.4:9999 exec "uname -a"
+Tampilan interaktif:
+```text
+🔍 Menghubungi Agent di 1.2.3.4:9999 untuk mengambil identitas kunci publik (TOFU)...
+🔒 KUNCI PUBLIK AGENT TERVERIFIKASI: SHA256:4b...
+🔒 Agent membutuhkan otorisasi untuk Controller baru.
+🔑 Masukkan Password / Pairing Token: ********
+✅ Pairing berhasil! Kunci Controller telah diotorisasi di Agent (~/.p/authorized_controllers).
 
-# Unggah File Lokal ke Agent (Chunk 32 KB)
-./target/release/p controller --addr 1.2.3.4:9999 upload ./file.zip
+══════════════════════════════════════════════════════════
+💻 SESI INTERAKTIF REMOTE SHELL (p controller)
+   Target Host : 1.2.3.4:9999
+   Bantuan     : Ketik 'help' untuk daftar perintah khusus
+   Keluar      : Ketik 'exit' atau tekan Ctrl+C
+══════════════════════════════════════════════════════════
+p[1.2.3.4:9999]> whoami
+root
+p[1.2.3.4:9999]> uname -a
+Linux debian-server 6.1.0-21-amd64 #1 SMP x86_64 GNU/Linux
+p[1.2.3.4:9999]> stats
+📊 CPU: 1.20% | RAM: 320 MB
+p[1.2.3.4:9999]> download /etc/hosts ./hosts.txt
+📥 Mengunduh file 'hosts' (250 byte, 1 chunks)...
+✅ File berhasil diunduh ke: ./hosts.txt
+p[1.2.3.4:9999]> exit
+👋 Sesi remote shell ditutup.
+```
 
-# Unduh File Remote dari Agent ke Mesin Lokal (Chunk 32 KB)
-./target/release/p controller --addr 1.2.3.4:9999 download /var/log/syslog ./syslog.log
+> **Zero-Friction:** Pada koneksi berikutnya, Controller langsung terhubung tanpa perlu memasukkan password lagi karena kunci Controller telah masuk di whitelist `~/.p/authorized_controllers` Agent!
 
-# Rotasi Kunci Sesi Secara Manual
-./target/release/p controller --addr 1.2.3.4:9999 rekey
+#### Menjalankan Perintah Sekali Jalan (Non-Interactive / Scripting):
+```bash
+# Cek Statistik
+./target/release/p controller 1.2.3.4:9999 stats
 
-# Local Port Forwarding Multiplexed (SSH -L 8080:80)
-# Membuka layanan remote di Agent (port 80) agar bisa diakses di laptop Controller (port 8080)
-./target/release/p controller --addr 1.2.3.4:9999 forward-local -L 8080:80
+# Eksekusi Terminal
+./target/release/p controller 1.2.3.4:9999 exec "systemctl status nginx"
 
-# Remote Port Forwarding Multiplexed (SSH -R 9090:8080)
-# Membuka aplikasi lokal di Controller (port 8080) agar bisa diakses dari sisi Agent (port 9090)
-./target/release/p controller --addr 1.2.3.4:9999 forward-remote -R 9090:8080
+# Upload & Download File
+./target/release/p controller 1.2.3.4:9999 upload ./file.zip
+./target/release/p controller 1.2.3.4:9999 download /var/log/syslog ./syslog.log
 
-# Matikan Perangkat Jarak Jauh
-./target/release/p controller --addr 1.2.3.4:9999 shutdown
+# Rotasi Kunci Sesi
+./target/release/p controller 1.2.3.4:9999 rekey
+
+# Port Forwarding
+./target/release/p controller 1.2.3.4:9999 forward-local -L 8080:80
+./target/release/p controller 1.2.3.4:9999 forward-remote -R 9090:8080
+
+# Matikan Perangkat
+./target/release/p controller 1.2.3.4:9999 shutdown
 ```
 
 ---
@@ -256,6 +286,8 @@ Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex)
 ## 🏗️ Status Implementasi (Completed ✅)
 
 - [x] **Single Binary Architecture (`p`):** Menggabungkan peran Agent, Controller, dan Keygen ke dalam satu biner tunggal hemat memori dan ukuran (~1.3 MB).
+- [x] **SSH-Style Interactive REPL Shell:** Cukup ketik `p controller <IP:PORT>` untuk langsung masuk ke sesi shell prompt `p[IP:PORT]>` tanpa harus berulang kali mengetik perintah CLI.
+- [x] **Pairing Token & `authorized_controllers`:** Autentikasi password aman pada koneksi pertama dan penyimpanan whitelist otomatis sehingga login berikutnya berlangsung instan.
 - [x] **SSH-Style TOFU Key Discovery:** Otomatis mengambil dan memverifikasi public key Agent pada koneksi pertama serta mencatat di `~/.p/known_agents` tanpa copy-paste manual.
 - [x] **Bi-Directional File Transfer:** Transfer file dua arah yang aman (`upload` & `download`) berbasis chunking 32 KB hemat memori.
 - [x] **Handshake Awal:** Selesai menggunakan `snow` (`Noise_IK_25519_ChaChaPoly_BLAKE2b`) di atas `tokio::net::TcpStream`.

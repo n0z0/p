@@ -104,6 +104,10 @@ impl NoiseSession {
     pub fn session_duration_secs(&self) -> u64 {
         self.created_at.elapsed().as_secs()
     }
+
+    pub fn get_remote_static(&self) -> Option<&[u8]> {
+        self.transport.get_remote_static()
+    }
 }
 
 pub const DISCOVERY_MAGIC_REQ: &[u8] = b"P_DISCOVERY_REQ_V1\0";
@@ -199,4 +203,66 @@ pub fn save_known_agent(addr: &str, pubkey_hex: &str) -> std::io::Result<()> {
     writeln!(file, "{}={}", addr.trim(), pubkey_hex.trim())?;
     Ok(())
 }
+
+/// Memeriksa apakah kunci publik Controller ada di daftar ~/.p/authorized_controllers
+pub fn is_controller_authorized(pubkey: &[u8]) -> bool {
+    let auth_file = get_config_dir().join("authorized_controllers");
+    if !auth_file.exists() {
+        return false;
+    }
+    let target_hex = hex::encode(pubkey).to_lowercase();
+    if let Ok(content) = std::fs::read_to_string(auth_file) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let key_part = line.split_whitespace().next().unwrap_or("").to_lowercase();
+            if key_part == target_hex {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Menambahkan kunci publik Controller ke ~/.p/authorized_controllers
+pub fn add_authorized_controller(pubkey: &[u8], comment: Option<&str>) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = get_config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let auth_file = dir.join("authorized_controllers");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(auth_file)?;
+    let key_hex = hex::encode(pubkey);
+    let desc = comment.unwrap_or("controller");
+    writeln!(file, "{} # {}", key_hex, desc)?;
+    Ok(())
+}
+
+/// Menghasilkan token pairing acak (format xxxx-xxxx)
+pub fn generate_pairing_token() -> String {
+    format!("{:04x}-{:04x}", rand::random::<u16>(), rand::random::<u16>())
+}
+
+/// Memuat atau membuat token pairing rahasia milik Agent (~/.p/agent.token)
+pub fn load_or_create_agent_token() -> String {
+    let dir = get_config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let token_file = dir.join("agent.token");
+    if token_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&token_file) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    let token = generate_pairing_token();
+    let _ = std::fs::write(&token_file, &token);
+    token
+}
+
 

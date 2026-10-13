@@ -555,3 +555,75 @@ async fn test_download_file_transfer() {
     agent_handle.await.unwrap();
 }
 
+#[tokio::test]
+async fn test_pairing_token_authentication() {
+    let agent_keypair = generate_keypair().unwrap();
+    let controller_keypair = generate_keypair().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let agent_priv = agent_keypair.private.clone();
+    let agent_pub = agent_keypair.public.clone();
+    let controller_priv = controller_keypair.private.clone();
+
+    let expected_token = "secret-token-123";
+
+    let agent_pub_for_agent = agent_pub.clone();
+    // Agent side simulating auth challenge
+    let agent_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_agent).await.unwrap();
+
+        // 1. Send challenge
+        framed.send_response(&CommandResponse::AuthChallenge).await.unwrap();
+
+        // 2. Expect Authenticate command
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::Authenticate { token } => {
+                if token == expected_token {
+                    framed.send_response(&CommandResponse::AuthSuccess).await.unwrap();
+                } else {
+                    framed.send_response(&CommandResponse::AuthFailed("Invalid token".into())).await.unwrap();
+                }
+            }
+            _ => panic!("Expected Authenticate command"),
+        }
+
+        // 3. Normal command after auth
+        let next_cmd = framed.recv_command().await.unwrap();
+        assert_eq!(next_cmd, RemoteCommand::GetSystemStats);
+        framed.send_response(&CommandResponse::SystemStats { cpu_usage: 5.0, ram_used_mb: 1000 }).await.unwrap();
+    });
+
+    // Controller side
+    let mut controller = NoiseFramedStream::connect_as_initiator(
+        &addr.to_string(),
+        &controller_priv,
+        &agent_pub,
+    ).await.unwrap();
+
+    let challenge = controller.recv_response().await.unwrap();
+    assert_eq!(challenge, CommandResponse::AuthChallenge);
+
+    // Send correct token
+    controller.send_command(&RemoteCommand::Authenticate { token: expected_token.into() }).await.unwrap();
+    let auth_ack = controller.recv_response().await.unwrap();
+    assert_eq!(auth_ack, CommandResponse::AuthSuccess);
+
+    // Subsequent command works
+    controller.send_command(&RemoteCommand::GetSystemStats).await.unwrap();
+    let stats = controller.recv_response().await.unwrap();
+    match stats {
+        CommandResponse::SystemStats { cpu_usage, ram_used_mb } => {
+            assert_eq!(cpu_usage, 5.0);
+            assert_eq!(ram_used_mb, 1000);
+        }
+        _ => panic!("Expected SystemStats"),
+    }
+
+    agent_handle.await.unwrap();
+}
+
+

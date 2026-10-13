@@ -188,4 +188,9 @@ impl NoiseFramedStream {
     pub fn total_bytes(&self) -> u64 {
         self.session.total_bytes()
     }
+
+    /// Kunci publik remote dari pihak lawan handshake (32 byte)
+    pub fn get_remote_static(&self) -> Option<&[u8]> {
+        self.session.get_remote_static()
+    }
 }
