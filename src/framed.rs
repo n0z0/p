@@ -138,13 +138,12 @@ impl NoiseFramedStream {
         Ok(res)
     }
 
-    /// Melakukan rotasi kunci sesi simetris (re-keying)
-    pub fn rekey(&mut self) -> Result<(), FrameError> {
-        self.session.rekey()?;
-        Ok(())
+    /// Pemicu rotasi kunci secara manual
+    pub fn rekey(&mut self) -> Result<(), CryptoError> {
+        self.session.rekey()
     }
 
-    /// Mengecek apakah batas rotasi kunci (waktu / volume) telah terlampaui
+    /// Cek apakah rotasi kunci diperlukan
     pub fn needs_rekey(&self, max_duration_secs: u64, max_bytes: u64) -> bool {
         self.session.needs_rekey(max_duration_secs, max_bytes)
     }

@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::Args;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,41 +10,36 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
-use shared::crypto::generate_keypair;
-use shared::framed::NoiseFramedStream;
-use shared::os::{execute_os_command, get_system_stats, shutdown_system};
-use shared::protocol::{CommandResponse, RemoteCommand};
+use crate::crypto::generate_keypair;
+use crate::framed::NoiseFramedStream;
+use crate::os::{execute_os_command, get_system_stats, shutdown_system};
+use crate::protocol::{CommandResponse, RemoteCommand};
 
-#[derive(Parser, Debug)]
-#[command(name = "agent", author, version, about = "Custom Lightweight Remote Control Agent")]
-struct Args {
+#[derive(Args, Debug, Clone)]
+pub struct AgentArgs {
     /// Mode operasi: 'listen' untuk menunggu Controller atau 'connect' untuk reverse-connection ke Controller
     #[arg(short, long, default_value = "listen")]
-    mode: String,
+    pub mode: String,
 
     /// Alamat target (0.0.0.0:9999 untuk listen, atau 127.0.0.1:9999 untuk connect)
     #[arg(short, long, default_value = "0.0.0.0:9999")]
-    addr: String,
+    pub addr: String,
 
     /// Kunci privat statis dalam format heksadesimal (32-byte). Jika kosong, kunci acak akan dibuat
     #[arg(short, long)]
-    privkey: Option<String>,
+    pub privkey: Option<String>,
 
-    /// Kunci publik Controller (hanya digunakan saat mode 'connect' jika diperlukan)
-    #[arg(long)]
-    controller_pubkey: Option<String>,
+    /// Folder penyimpanan file yang diterima
+    #[arg(short, long, default_value = "./storage")]
+    pub storage_dir: PathBuf,
 
-    /// Direktori penyimpanan file yang diterima melalui chunk transfer
-    #[arg(long, default_value = "./received_files")]
-    storage_dir: PathBuf,
-
-    /// Interval rotasi kunci berkala dalam detik (default: 3600 detik = 1 jam)
+    /// Interval rotasi kunci otomatis dalam detik (default: 3600s / 1 jam)
     #[arg(long, default_value_t = 3600)]
-    key_rotation_secs: u64,
+    pub key_rotation_secs: u64,
 
-    /// Batas volume data untuk rotasi kunci dalam byte (default: 1 GB)
+    /// Batas volume data rotasi kunci otomatis dalam byte (default: 1 GB)
     #[arg(long, default_value_t = 1_073_741_824)]
-    key_rotation_bytes: u64,
+    pub key_rotation_bytes: u64,
 }
 
 struct FileTransferState {
@@ -54,62 +49,55 @@ struct FileTransferState {
     file: File,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+pub async fn run_agent(args: AgentArgs) -> Result<()> {
+    tokio::fs::create_dir_all(&args.storage_dir)
+        .await
+        .context("Gagal membuat direktori storage")?;
 
-    let args = Args::parse();
-    tokio::fs::create_dir_all(&args.storage_dir).await?;
-
-    let (privkey, pubkey) = match args.privkey.as_deref() {
+    let privkey_bytes = match &args.privkey {
         Some(hex_str) => {
             let bytes = hex::decode(hex_str.trim()).context("Format hex privkey tidak valid")?;
             if bytes.len() != 32 {
-                bail!("Panjang privkey harus 32 byte!");
+                bail!("Panjang privkey harus tepat 32 byte!");
             }
-            (bytes, None)
+            bytes
         }
         None => {
-            let keypair = generate_keypair().context("Gagal membuat kunci 25519")?;
-            info!(
-                "🔑 Kunci statis baru dibuat:\n   Public Key:  {}\n   Private Key: {}",
-                hex::encode(&keypair.public),
-                hex::encode(&keypair.private)
-            );
-            (keypair.private, Some(keypair.public))
+            let keypair = generate_keypair().context("Gagal membuat pasangan kunci")?;
+            println!("🔑 Pasangan Kunci Baru Dibuat:");
+            println!("   Public Key  (Pasang di Controller) : {}", hex::encode(&keypair.public));
+            println!("   Private Key (Simpan di Agent)      : {}", hex::encode(&keypair.private));
+            println!();
+            keypair.private
         }
     };
 
-    if let Some(pubk) = pubkey {
-        info!("📢 Bagikan Public Key ini ke Controller: {}", hex::encode(pubk));
-    }
-
-    match args.mode.as_str() {
+    match args.mode.to_lowercase().as_str() {
         "listen" => {
-            run_listener_mode(&args, &privkey).await?;
+            run_listen_loop(&args, &privkey_bytes).await?;
         }
         "connect" => {
-            run_reconnect_loop(&args, &privkey).await?;
+            run_reconnect_loop(&args, &privkey_bytes).await?;
         }
         other => {
-            bail!("Mode tidak dikenal: {}. Gunakan 'listen' atau 'connect'", other);
+            bail!("Mode tidak dikenal '{}'. Gunakan 'listen' atau 'connect'.", other);
         }
     }
 
     Ok(())
 }
 
-/// Menjalankan Agent dalam mode Listen (Server)
-async fn run_listener_mode(args: &Args, privkey: &[u8]) -> Result<()> {
+async fn run_listen_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
     let listener = TcpListener::bind(&args.addr)
         .await
         .with_context(|| format!("Gagal bind ke {}", args.addr))?;
-    info!("🚀 Agent aktif dan mendengarkan di TCP {}", args.addr);
+
+    info!("🚀 Remote Agent aktif dalam mode LISTEN di {}", args.addr);
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                info!("🤝 Koneksi masuk dari: {}", peer_addr);
+                info!("🌐 Koneksi masuk dari {}", peer_addr);
                 let privkey_clone = privkey.to_vec();
                 let storage_dir = args.storage_dir.clone();
                 let rot_secs = args.key_rotation_secs;
@@ -120,24 +108,23 @@ async fn run_listener_mode(args: &Args, privkey: &[u8]) -> Result<()> {
                         Ok(framed) => {
                             info!("🔒 Handshake Noise IK sukses dengan {}", peer_addr);
                             if let Err(e) = handle_session(framed, storage_dir, rot_secs, rot_bytes).await {
-                                warn!("⚠️ Sesi dengan {} berakhir: {}", peer_addr, e);
+                                warn!("⚠️ Sesi terputus dengan {}: {}", peer_addr, e);
                             }
                         }
                         Err(e) => {
-                            error!("❌ Handshake gagal dengan {}: {}", peer_addr, e);
+                            warn!("❌ Handshake gagal dari {}: {}", peer_addr, e);
                         }
                     }
                 });
             }
             Err(e) => {
-                warn!("Gagal menerima koneksi: {}", e);
+                error!("Gagal menerima koneksi: {}", e);
             }
         }
     }
 }
 
-/// Menjalankan Agent dalam mode Connect dengan Exponential Backoff (Auto-Reconnect)
-async fn run_reconnect_loop(args: &Args, privkey: &[u8]) -> Result<()> {
+async fn run_reconnect_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
     let mut backoff = 1u64;
     let max_backoff = 60u64;
 
@@ -149,7 +136,7 @@ async fn run_reconnect_loop(args: &Args, privkey: &[u8]) -> Result<()> {
                 match NoiseFramedStream::accept_as_responder(stream, privkey).await {
                     Ok(framed) => {
                         info!("🔒 Handshake terenkripsi sukses!");
-                        backoff = 1; // reset backoff setelah berhasil terhubung
+                        backoff = 1;
                         if let Err(e) = handle_session(
                             framed,
                             args.storage_dir.clone(),
@@ -177,7 +164,6 @@ async fn run_reconnect_loop(args: &Args, privkey: &[u8]) -> Result<()> {
     }
 }
 
-/// Loop penanganan perintah dan respons dalam sesi terenkripsi
 async fn handle_session(
     mut stream: NoiseFramedStream,
     storage_dir: PathBuf,
@@ -191,7 +177,6 @@ async fn handle_session(
     let mut current_file: Option<FileTransferState> = None;
 
     loop {
-        // Cek apakah rotasi kunci otomatis perlu dipicu
         if stream.needs_rekey(key_rotation_secs, key_rotation_bytes) {
             info!("🔄 Batas waktu/volume data rotasi kunci tercapai. Memutar kunci simetris...");
             if let Err(e) = stream.rekey() {
@@ -200,12 +185,10 @@ async fn handle_session(
         }
 
         tokio::select! {
-            // Tangani pengiriman respons asinkron (misal: port forward data inbound)
             Some(resp) = outbound_rx.recv() => {
                 stream.send_response(&resp).await?;
             }
 
-            // Terima perintah dari Controller
             cmd_res = stream.recv_command() => {
                 let cmd = match cmd_res {
                     Ok(c) => c,
@@ -226,34 +209,45 @@ async fn handle_session(
                     }
 
                     RemoteCommand::GetSystemStats => {
+                        info!("📊 Membaca metrik performa sistem (CPU & RAM)...");
                         let (cpu_usage, ram_used_mb) = get_system_stats();
-                        stream.send_response(&CommandResponse::SystemStats { cpu_usage, ram_used_mb }).await?;
-                    }
-
-                    RemoteCommand::ShutdownDevice => {
-                        info!("🛑 Menerima perintah Shutdown!");
-                        let _ = shutdown_system();
-                        stream.send_response(&CommandResponse::TerminalOutput {
-                            stdout: "Perintah shutdown telah dikirim ke OS.".into(),
-                            stderr: String::new(),
+                        stream.send_response(&CommandResponse::SystemStats {
+                            cpu_usage,
+                            ram_used_mb,
                         }).await?;
                     }
 
-                    RemoteCommand::StartFileTransfer { filename, total_chunks } => {
-                        info!("📁 Memulai penerimaan file: {} (total {} chunks)", filename, total_chunks);
-                        let clean_filename = Path::new(&filename)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("received_file.bin");
-                        let file_path = storage_dir.join(clean_filename);
+                    RemoteCommand::ShutdownDevice => {
+                        info!("🛑 Menerima perintah shutdown perangkat!");
+                        match shutdown_system() {
+                            Ok(msg) => {
+                                stream.send_response(&CommandResponse::TerminalOutput {
+                                    stdout: format!("Shutdown berhasil dipicu: {}", msg),
+                                    stderr: String::new(),
+                                }).await?;
+                            }
+                            Err(err) => {
+                                stream.send_response(&CommandResponse::ExecutionError(err)).await?;
+                            }
+                        }
+                    }
 
-                        match OpenOptions::new().write(true).create(true).truncate(true).open(&file_path).await {
-                            Ok(file) => {
+                    RemoteCommand::StartFileTransfer { filename, total_chunks } => {
+                        info!("📥 Memulai penerimaan file: {} (total {} chunk)", filename, total_chunks);
+                        let file_path = storage_dir.join(Path::new(&filename).file_name().unwrap_or(filename.as_ref()));
+                        match OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(true)
+                            .open(&file_path)
+                            .await
+                        {
+                            Ok(f) => {
                                 current_file = Some(FileTransferState {
-                                    filename: clean_filename.to_string(),
+                                    filename: filename.clone(),
                                     total_chunks,
                                     received_chunks: 0,
-                                    file,
+                                    file: f,
                                 });
                                 stream.send_response(&CommandResponse::FileChunkAck {
                                     chunk_index: 0,
@@ -307,7 +301,6 @@ async fn handle_session(
 
                                 channels.lock().await.insert(channel_id, data_tx);
 
-                                // Task untuk menulis data dari Controller ke target port internal
                                 tokio::spawn(async move {
                                     while let Some(chunk) = data_rx.recv().await {
                                         if let Err(e) = writer.write_all(&chunk).await {
@@ -317,13 +310,12 @@ async fn handle_session(
                                     }
                                 });
 
-                                // Task untuk membaca data dari target port internal lalu mengirim balik ke Controller
                                 let outbound_tx_clone = outbound_tx.clone();
                                 tokio::spawn(async move {
                                     let mut buf = vec![0u8; 16384];
                                     loop {
                                         match reader.read(&mut buf).await {
-                                            Ok(0) => break, // EOF
+                                            Ok(0) => break,
                                             Ok(n) => {
                                                 let payload = buf[..n].to_vec();
                                                 if outbound_tx_clone
@@ -427,7 +419,6 @@ async fn handle_session(
                                                     break;
                                                 }
 
-                                                // Task tulis data dari Controller ke client remote di Agent
                                                 tokio::spawn(async move {
                                                     while let Some(chunk) = data_rx.recv().await {
                                                         if client_writer.write_all(&chunk).await.is_err() {
@@ -436,7 +427,6 @@ async fn handle_session(
                                                     }
                                                 });
 
-                                                // Task baca data dari client remote di Agent lalu kirim ke Controller
                                                 let outbound_tx_stream = outbound_tx_listener.clone();
                                                 let channels_cleanup = channels_listener.clone();
                                                 tokio::spawn(async move {

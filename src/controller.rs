@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,52 +9,46 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use shared::crypto::generate_keypair;
-use shared::framed::NoiseFramedStream;
-use shared::protocol::{CommandResponse, RemoteCommand};
+use crate::crypto::generate_keypair;
+use crate::framed::NoiseFramedStream;
+use crate::protocol::{CommandResponse, RemoteCommand};
 
-#[derive(Parser, Debug)]
-#[command(name = "controller", author, version, about = "Custom Lightweight Remote Control Client/Controller")]
-struct Cli {
+#[derive(Args, Debug, Clone)]
+pub struct ControllerArgs {
     /// Alamat Target Agent (default: 127.0.0.1:9999)
     #[arg(short, long, default_value = "127.0.0.1:9999")]
-    addr: String,
+    pub addr: String,
 
     /// Kunci privat statis Controller (32-byte hex). Jika kosong, kunci sementara dibuat
     #[arg(long)]
-    privkey: Option<String>,
+    pub privkey: Option<String>,
 
-    /// Kunci publik statis Target Agent (32-byte hex) yang wajib diketahui (Noise IK)
-    #[arg(long)]
-    agent_pubkey: Option<String>,
+    /// Kunci publik statis milik Target Agent (32-byte hex)
+    #[arg(short, long)]
+    pub agent_pubkey: Option<String>,
 
     #[command(subcommand)]
-    command: Commands,
+    pub command: ControllerCommand,
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Buat pasangan kunci 25519 baru untuk Agent atau Controller
-    Keygen,
-
-    /// Jalankan perintah terminal jarak jauh
+#[derive(Subcommand, Debug, Clone)]
+pub enum ControllerCommand {
+    /// Menjalankan perintah terminal di Agent
     Exec {
-        /// Perintah yang akan dijalankan
+        /// Perintah terminal yang ingin dieksekusi
         command: String,
     },
 
-    /// Dapatkan metrik statistik sistem dari Agent (CPU, RAM)
+    /// Mengambil metrik sistem dari Agent (CPU & RAM)
     Stats,
 
-    /// Unggah file ke Agent menggunakan pengiriman berbasis chunk (64KB)
+    /// Mengunggah file ke Agent dengan pembagian chunk
     Upload {
-        /// Jalur file lokal yang ingin diunggah
-        local_path: PathBuf,
-        /// Nama file tujuan di Agent (opsional)
-        remote_name: Option<String>,
+        /// Path file lokal yang akan diunggah
+        filepath: PathBuf,
     },
 
-    /// Minta Agent melakukan rotasi kunci sesi (Re-Keying)
+    /// Rotasi kunci sesi secara manual
     Rekey,
 
     /// Port Forwarding Lokal (-L local_port:target_port)
@@ -75,22 +69,10 @@ enum Commands {
     Shutdown,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+const CHUNK_SIZE: usize = 32 * 1024; // 32 KB per chunk
 
-    let cli = Cli::parse();
-
-    if let Commands::Keygen = cli.command {
-        let keypair = generate_keypair().context("Gagal membuat kunci 25519")?;
-        println!("🔑 PASANGAN KUNCI BARU (25519):");
-        println!("   Public Key:  {}", hex::encode(&keypair.public));
-        println!("   Private Key: {}", hex::encode(&keypair.private));
-        println!("\n💡 Salin Public Key ke Controller (--agent-pubkey) dan Private Key ke Agent (--privkey).");
-        return Ok(());
-    }
-
-    let agent_pubkey_bytes = match cli.agent_pubkey {
+pub async fn run_controller(args: ControllerArgs) -> Result<()> {
+    let agent_pubkey_bytes = match args.agent_pubkey {
         Some(hex_str) => {
             let bytes = hex::decode(hex_str.trim()).context("Format hex agent_pubkey tidak valid")?;
             if bytes.len() != 32 {
@@ -103,7 +85,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let controller_privkey_bytes = match cli.privkey {
+    let controller_privkey_bytes = match args.privkey {
         Some(hex_str) => {
             let bytes = hex::decode(hex_str.trim()).context("Format hex privkey tidak valid")?;
             if bytes.len() != 32 {
@@ -118,21 +100,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    info!("🔌 Menghubungkan ke Target Agent di {}...", cli.addr);
+    info!("🌐 Menghubungkan ke Agent di {}...", args.addr);
     let mut stream = NoiseFramedStream::connect_as_initiator(
-        &cli.addr,
+        &args.addr,
         &controller_privkey_bytes,
         &agent_pubkey_bytes,
     )
     .await
-    .with_context(|| format!("Gagal melakukan handshake dengan {}", cli.addr))?;
-    info!("🔒 Terhubung & Terenkripsi dengan Noise IK!");
+    .context("Gagal melakukan handshake terenkripsi Noise ke Agent")?;
 
-    match cli.command {
-        Commands::Keygen => unreachable!(),
+    info!("🔒 Terhubung dengan aman ke Agent! Mengirim perintah...");
 
-        Commands::Exec { command } => {
-            info!("📤 Mengirim perintah terminal: {}", command);
+    match args.command {
+        ControllerCommand::Exec { command } => {
             stream.send_command(&RemoteCommand::RunTerminal(command)).await?;
             let resp = stream.recv_response().await?;
             match resp {
@@ -144,8 +124,8 @@ async fn main() -> Result<()> {
                         eprint!("{}", stderr);
                     }
                 }
-                CommandResponse::ExecutionError(e) => {
-                    eprintln!("❌ Error eksekusi: {}", e);
+                CommandResponse::ExecutionError(err) => {
+                    eprintln!("❌ Error eksekusi di Agent: {}", err);
                 }
                 other => {
                     println!("Respons tak terduga: {:?}", other);
@@ -153,45 +133,39 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Stats => {
-            info!("📊 Mengambil metrik sistem...");
+        ControllerCommand::Stats => {
             stream.send_command(&RemoteCommand::GetSystemStats).await?;
             let resp = stream.recv_response().await?;
             match resp {
                 CommandResponse::SystemStats { cpu_usage, ram_used_mb } => {
-                    println!("╔════════════════════════════════════╗");
-                    println!("║       METRIK SISTEM REMOTE         ║");
-                    println!("╠════════════════════════════════════╣");
-                    println!("║  CPU Usage : {:>6.2}%               ║", cpu_usage);
-                    println!("║  RAM Used  : {:>6} MB             ║", ram_used_mb);
-                    println!("╚════════════════════════════════════╝");
+                    println!("📊 STATISTIK AGENT REMOTE:");
+                    println!("   Utilisasi CPU : {:.2}%", cpu_usage);
+                    println!("   Penggunaan RAM: {} MB", ram_used_mb);
                 }
                 other => println!("Respons: {:?}", other),
             }
         }
 
-        Commands::Upload { local_path, remote_name } => {
-            let mut file = File::open(&local_path)
+        ControllerCommand::Upload { filepath } => {
+            let mut file = File::open(&filepath)
                 .await
-                .with_context(|| format!("Gagal membuka file lokal: {}", local_path.display()))?;
+                .with_context(|| format!("Gagal membuka file lokal: {}", filepath.display()))?;
+
             let metadata = file.metadata().await?;
             let file_size = metadata.len();
-
-            let filename = remote_name.unwrap_or_else(|| {
-                local_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("uploaded_file.bin")
-                    .to_string()
-            });
-
-            const CHUNK_SIZE: usize = 32 * 1024; // 32 KB per chunk (fit securely inside Noise MAX_MESSAGE_LEN)
             let total_chunks = ((file_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as u32;
 
-            println!("📦 Memulai upload: {} ({} bytes, {} chunks)", filename, file_size, total_chunks);
+            let filename = filepath
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            println!("📤 Mengunggah file '{}' ({} byte, {} chunks)...", filename, file_size, total_chunks);
+
             stream
                 .send_command(&RemoteCommand::StartFileTransfer {
-                    filename,
+                    filename: filename.clone(),
                     total_chunks,
                 })
                 .await?;
@@ -237,7 +211,7 @@ async fn main() -> Result<()> {
             println!("\n✅ File berhasil diunggah secara utuh!");
         }
 
-        Commands::Rekey => {
+        ControllerCommand::Rekey => {
             println!("🔄 Meminta rotasi kunci sesi...");
             stream.send_command(&RemoteCommand::RequestKeyRotation).await?;
             stream.rekey()?;
@@ -250,7 +224,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::ForwardLocal { mapping } => {
+        ControllerCommand::ForwardLocal { mapping } => {
             let parts: Vec<&str> = mapping.split(':').collect();
             if parts.len() != 2 {
                 bail!("Format mapping harus berupa 'local_port:target_port', contoh: '8080:80'");
@@ -273,12 +247,10 @@ async fn main() -> Result<()> {
 
             loop {
                 tokio::select! {
-                    // Meneruskan perintah outbound ke Agent
                     Some(cmd) = outbound_rx.recv() => {
                         stream.send_command(&cmd).await?;
                     }
 
-                    // Menerima data inbound dari Agent
                     resp_res = stream.recv_response() => {
                         let resp = match resp_res {
                             Ok(r) => r,
@@ -304,7 +276,6 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // Menerima koneksi lokal baru
                     Ok((local_stream, client_addr)) = local_listener.accept() => {
                         channel_counter += 1;
                         let channel_id = channel_counter;
@@ -314,13 +285,11 @@ async fn main() -> Result<()> {
                         let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(100);
                         channels.lock().await.insert(channel_id, data_tx);
 
-                        // Kirim OpenForwardChannel
                         let _ = outbound_tx.send(RemoteCommand::OpenForwardChannel {
                             channel_id,
                             target_port,
                         }).await;
 
-                        // Task membaca dari socket lokal dan mengirim ForwardData ke Agent
                         let outbound_tx_clone = outbound_tx.clone();
                         tokio::spawn(async move {
                             let mut buf = vec![0u8; 16384];
@@ -339,7 +308,6 @@ async fn main() -> Result<()> {
                             let _ = outbound_tx_clone.send(RemoteCommand::CloseForwardChannel { channel_id }).await;
                         });
 
-                        // Task menerima data dari Agent dan menulis ke socket lokal
                         tokio::spawn(async move {
                             while let Some(chunk) = data_rx.recv().await {
                                 if local_writer.write_all(&chunk).await.is_err() {
@@ -352,7 +320,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::ForwardRemote { mapping } => {
+        ControllerCommand::ForwardRemote { mapping } => {
             let parts: Vec<&str> = mapping.split(':').collect();
             if parts.len() != 2 {
                 bail!("Format mapping harus berupa 'agent_port:controller_port', contoh: '9090:8080'");
@@ -412,7 +380,6 @@ async fn main() -> Result<()> {
                                         let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(100);
                                         channels_clone.lock().await.insert(channel_id, data_tx);
 
-                                        // Task: baca dari aplikasi lokal Controller dan kirim ForwardData ke Agent
                                         tokio::spawn(async move {
                                             let mut buf = vec![0u8; 16384];
                                             loop {
@@ -430,7 +397,6 @@ async fn main() -> Result<()> {
                                             let _ = outbound_tx_clone.send(RemoteCommand::CloseForwardChannel { channel_id }).await;
                                         });
 
-                                        // Task: terima data dari Agent dan tulis ke aplikasi lokal Controller
                                         tokio::spawn(async move {
                                             while let Some(chunk) = data_rx.recv().await {
                                                 if local_writer.write_all(&chunk).await.is_err() {
@@ -467,7 +433,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Shutdown => {
+        ControllerCommand::Shutdown => {
             println!("🛑 Mengirim sinyal Shutdown ke Agent...");
             stream.send_command(&RemoteCommand::ShutdownDevice).await?;
             let resp = stream.recv_response().await?;

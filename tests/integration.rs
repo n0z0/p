@@ -1,6 +1,6 @@
-use shared::crypto::generate_keypair;
-use shared::framed::NoiseFramedStream;
-use shared::protocol::{CommandResponse, RemoteCommand};
+use p::crypto::generate_keypair;
+use p::framed::NoiseFramedStream;
+use p::protocol::{CommandResponse, RemoteCommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -436,4 +436,3 @@ async fn test_remote_port_forwarding() {
     client_task.await.unwrap();
     agent_handle.await.unwrap();
 }
-

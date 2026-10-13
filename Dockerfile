@@ -15,15 +15,13 @@ RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /app
 COPY . .
 
-# Build binary Agent & Controller untuk Windows (.exe)
+# Build binary p untuk Windows (.exe)
 RUN cargo build --release --target x86_64-pc-windows-gnu
 
-# Build binary statis murni untuk Linux
+# Build binary p statis murni untuk Linux
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
 # Output stage
 FROM scratch AS artifacts
-COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/agent.exe /windows/agent.exe
-COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/controller.exe /windows/controller.exe
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/agent /linux/agent
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/controller /linux/controller
+COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/p.exe /windows/p.exe
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/p /linux/p

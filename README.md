@@ -188,56 +188,62 @@ pub fn execute_os_command(cmd_string: &str) -> Result<String, String> {
 
 ---
 
-## 💻 Panduan Penggunaan & Kompilasi (CLI Usage)
+## 💻 Panduan Penggunaan & Kompilasi (Single Binary `p`)
+
+Seluruh fungsi Agent, Controller, dan Keygen tergabung dalam **satu file biner tunggal: `p`** (atau `p.exe`).
 
 ### 1. Kompilasi Release (Statis & Stripped)
 ```bash
 cargo build --release
 ```
-Biner akan dihasilkan di `target/release/agent` dan `target/release/controller`.
+Biner tunggal akan dihasilkan di `target/release/p` (atau `target/release/p.exe`). Ukuran biner hanya **~1.3 MB** (jauh di bawah batas toleransi 4 MB).
 
 ### 2. Membuat Pasangan Kunci 25519
 ```bash
-./target/release/controller keygen
+./target/release/p keygen
 ```
 Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex).
 
-### 3. Menjalankan Target Agent
+### 3. Menjalankan Mode Agent (di Server / VPS / IoT)
 ```bash
 # Mode Listen (Direct Mode)
-./target/release/agent --mode listen --addr 0.0.0.0:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
+./target/release/p agent --mode listen --addr 0.0.0.0:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
 
 # Mode Connect (Reverse Connection dengan Auto-Reconnect)
-./target/release/agent --mode connect --addr 127.0.0.1:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
+./target/release/p agent --mode connect --addr 1.2.3.4:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
 ```
 
-### 4. Menjalankan Perintah dari Controller
+### 4. Menjalankan Perintah dari Controller (di Laptop / PC Admin)
 ```bash
 # Mengambil Statistik Remote (CPU & RAM)
-./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> stats
+./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> stats
 
-# Eksekusi Perintah Terminal
-./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> exec "uname -a"
+# Eksekusi Perintah Terminal OS Jarak Jauh
+./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> exec "uname -a"
 
 # Unggah File Berbasis Chunk (32 KB per chunk)
-./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> upload ./file.zip
+./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> upload ./file.zip
 
 # Rotasi Kunci Sesi Secara Manual
-./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> rekey
+./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> rekey
 
 # Local Port Forwarding Multiplexed (SSH -L 8080:80)
 # Membuka layanan remote di Agent (port 80) agar bisa diakses di laptop Controller (port 8080)
-./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-local -L 8080:80
+./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-local -L 8080:80
 
 # Remote Port Forwarding Multiplexed (SSH -R 9090:8080)
 # Membuka aplikasi lokal di Controller (port 8080) agar bisa diakses dari sisi Agent (port 9090)
-./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-remote -R 9090:8080
+./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-remote -R 9090:8080
+
+# Matikan Perangkat Jarak Jauh
+./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> shutdown
 ```
 
 ---
 
 ## 🏗️ Status Implementasi (Completed ✅)
 
+- [x] **Single Binary Architecture (`p`):** Menggabungkan peran Agent, Controller, dan Keygen ke dalam satu biner tunggal hemat memori dan ukuran (~1.3 MB).
 - [x] **Handshake Awal:** Selesai menggunakan `snow` (`Noise_IK_25519_ChaChaPoly_BLAKE2b`) di atas `tokio::net::TcpStream`.
 - [x] **Stream Framed:** Pembungkus `NoiseFramedStream` memanfaatkan `tokio_util::codec::LengthDelimitedCodec` untuk mencegah fragmentasi data.
 - [x] **Auto-Reconnect Loop:** Modul resiliensi jaringan dengan strategi *Exponential Backoff* (1s - 60s) pada Agent.

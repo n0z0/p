@@ -102,18 +102,15 @@ jobs:
           RELEASE_DIR="p-${{ matrix.target }}"
           mkdir -p "$RELEASE_DIR"
 
-          # Copy binaries
-          cp "target/${{ matrix.target }}/release/agent${{ matrix.bin_ext }}" "$RELEASE_DIR/"
-          cp "target/${{ matrix.target }}/release/controller${{ matrix.bin_ext }}" "$RELEASE_DIR/"
+          # Copy binary
+          cp "target/${{ matrix.target }}/release/p${{ matrix.bin_ext }}" "$RELEASE_DIR/"
           cp README.md LICENSE "$RELEASE_DIR/" || true
 
           # Strip symbols for minimum binary size
           if [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.use_cross }}" = "false" ]; then
-            strip "$RELEASE_DIR/agent" || true
-            strip "$RELEASE_DIR/controller" || true
-          elif [ "${{ matrix.os }}" = "macos-latest" ] || [ "${{ matrix.os }}" = "macos-13" ]; then
-            strip "$RELEASE_DIR/agent" || true
-            strip "$RELEASE_DIR/controller" || true
+            strip "$RELEASE_DIR/p" || true
+          elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+            strip "$RELEASE_DIR/p" || true
           fi
 
           # Archive
