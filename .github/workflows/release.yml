@@ -1,0 +1,200 @@
+name: Multi-OS Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for release (misal: v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (musl - Pure Static)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: false
+            bin_ext: ''
+            archive_ext: 'tar.gz'
+
+          # Linux x86_64 (glibc)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+            bin_ext: ''
+            archive_ext: 'tar.gz'
+
+          # Linux aarch64 (ARM64 musl)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+            bin_ext: ''
+            archive_ext: 'tar.gz'
+
+          # Windows x86_64 (MSVC Standalone)
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+            bin_ext: '.exe'
+            archive_ext: 'zip'
+
+          # macOS Apple Silicon (M1/M2/M3)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+            bin_ext: ''
+            archive_ext: 'tar.gz'
+
+          # macOS Intel x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            use_cross: false
+            bin_ext: ''
+            archive_ext: 'tar.gz'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux Prerequisites
+        if: matrix.os == 'ubuntu-latest' && !matrix.use_cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Cross (Cross-Compilation)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Compile Release Binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      - name: Prepare Assets & Archive
+        shell: bash
+        run: |
+          RELEASE_DIR="p-${{ matrix.target }}"
+          mkdir -p "$RELEASE_DIR"
+
+          # Copy binaries
+          cp "target/${{ matrix.target }}/release/agent${{ matrix.bin_ext }}" "$RELEASE_DIR/"
+          cp "target/${{ matrix.target }}/release/controller${{ matrix.bin_ext }}" "$RELEASE_DIR/"
+          cp README.md LICENSE "$RELEASE_DIR/" || true
+
+          # Strip symbols for minimum binary size
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.use_cross }}" = "false" ]; then
+            strip "$RELEASE_DIR/agent" || true
+            strip "$RELEASE_DIR/controller" || true
+          elif [ "${{ matrix.os }}" = "macos-latest" ] || [ "${{ matrix.os }}" = "macos-13" ]; then
+            strip "$RELEASE_DIR/agent" || true
+            strip "$RELEASE_DIR/controller" || true
+          fi
+
+          # Archive
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            7z a "p-${{ matrix.target }}.zip" "$RELEASE_DIR"
+            echo "ARCHIVE=p-${{ matrix.target }}.zip" >> $GITHUB_ENV
+          else
+            tar -czvf "p-${{ matrix.target }}.tar.gz" "$RELEASE_DIR"
+            echo "ARCHIVE=p-${{ matrix.target }}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Generate Checksum
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ env.ARCHIVE }}" > "${{ env.ARCHIVE }}.sha256"
+          else
+            shasum -a 256 "${{ env.ARCHIVE }}" > "${{ env.ARCHIVE }}.sha256"
+          fi
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-packages
+
+      - name: Organize Release Files
+        run: |
+          mkdir -p dist
+          find release-packages -type f -exec cp {} dist/ \;
+          ls -lah dist/
+
+      - name: Determine Release Tag
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release & Upload Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          name: "Release ${{ steps.get_tag.outputs.tag }}"
+          draft: false
+          prerelease: false
+          files: dist/*
+          body: |
+            ## 🚀 Custom Lightweight Multiplatform Remote Control Agent (${{ steps.get_tag.outputs.tag }})
+
+            ### 📦 Paket Biner Tersedia:
+            - **Linux x86_64 (Musl Static):** `p-x86_64-unknown-linux-musl.tar.gz`
+            - **Linux x86_64 (Glibc):** `p-x86_64-unknown-linux-gnu.tar.gz`
+            - **Linux ARM64 (Musl):** `p-aarch64-unknown-linux-musl.tar.gz`
+            - **Windows x86_64:** `p-x86_64-pc-windows-msvc.zip`
+            - **macOS Apple Silicon (M1/M2/M3):** `p-aarch64-apple-darwin.tar.gz`
+            - **macOS Intel (x86_64):** `p-x86_64-apple-darwin.tar.gz`
+
+            ### 🛡️ Fitur Utama:
+            - **Zero-Fluff Noise Protocol (IK_25519_ChaChaPoly_BLAKE2b)**
+            - **Auto-Reconnect (Exponential Backoff)**
+            - **Chunk-Based File Transfer (32 KB per chunk)**
+            - **Periodic Key Rotation (Rekeying)**
+            - **Multiplexed Port Forwarding (SSH -L / -R tunneling)**
+            - **Memory Standby < 8 MB & Binary Size Stripped < 4 MB**

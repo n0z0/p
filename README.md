@@ -14,6 +14,40 @@ Sistem ini memangkas seluruh *overhead* tradisional dengan mengombinasikan kompo
 
 ---
 
+## 🧠 Konsep & Peran: Agent vs. Controller
+
+Dalam sistem kendali jarak jauh ini, komponen aplikasi dibagi menjadi dua modul terpisah dengan peran yang tidak sama rata:
+
+```text
+┌─────────────────────────────────┐                 ┌─────────────────────────────────┐
+│           CONTROLLER            │                 │              AGENT              │
+│  (Laptop / PC Administrator)    │                 │ (Server / VPS / Perangkat IoT)  │
+│                                 │                 │                                 │
+│  • Pihak yang MEMERINTAH        │   Noise TCP     │  • Pihak yang DIKENDALIKAN      │
+│  • Antarmuka CLI Interaktif     │ ──────────────> │  • Daemon Ringan (Tanpa UI)     │
+│  • Port Forwarding Client (-L)  │                 │  • Eksekusi Terminal & OS CMD   │
+│  • Membaca Stat & Unduh File    │                 │  • Monitoring RAM & CPU Lokal   │
+└─────────────────────────────────┘                 └─────────────────────────────────┘
+```
+
+### 1. 🤖 **Agent** (Target Remote / Service Daemon)
+* **Tempat Dijalankan:** Komputer target, server VPS, atau mesin IoT yang ingin Anda akses atau kelola dari jarak jauh.
+* **Peran:** Sebagai pihak yang **melayani instruksi**. Agent berjalan di latar belakang (daemon), mengeksekusi perintah terminal OS (`cmd` / `bash`), membaca utilisasi RAM & CPU, menyimpan potongan file (*chunk transfer*), dan meneruskan lalu lintas jaringan ke port internal lokal (seperti database MySQL `3306` atau web server `80`).
+
+### 2. 🎮 **Controller** (Admin Client Tool)
+* **Tempat Dijalankan:** Laptop atau PC kerja pribadi Anda (sang administrator/operator).
+* **Peran:** Sebagai **pusat kendali**. Controller adalah aplikasi CLI interaktif yang Anda gunakan untuk mengirim instruksi jarak jauh (`stats`, `exec`, `upload`, `rekey`, `forward-local`).
+
+### 🔄 Siapa "Client" dan Siapa "Server"?
+
+| Sudut Pandang | **Controller** | **Agent** | Penjelasan |
+| :--- | :--- | :--- | :--- |
+| **Logika Bisnis (Aplikasi)** | **Client** | **Server** | Controller bertindak sebagai pemohon/pemberi instruksi (*master*), sedangkan Agent adalah penyedia eksekusi (*worker*). |
+| **Koneksi Jaringan Direct** | **Client** (`connect`) | **Server** (`listen`) | Digunakan jika target/Agent memiliki IP Publik atau berada di satu jaringan lokal yang bisa diakses langsung oleh Controller. |
+| **Koneksi Jaringan Reverse** | **Server Hub** (`listen`) | **Client** (`connect` + *Auto-Reconnect*) | **Skenario Enterprise:** Agent berada di balik firewall/NAT perusahaan. Agent berinisiatif menghubungi Controller dengan strategi *Exponential Backoff*. Begitu terhubung, Controller tetap memegang kendali penuh. |
+
+---
+
 ## 🛡️ Fitur Lanjutan & Ketahanan Sistem (Enterprise Features)
 
 Untuk memastikan agen siap digunakan di lingkungan produksi yang dinamis, fitur-fitur ketahanan dan fungsionalitas jaringan tingkat tinggi berikut wajib diimplementasikan:
@@ -154,10 +188,54 @@ pub fn execute_os_command(cmd_string: &str) -> Result<String, String> {
 
 ---
 
-## 🏗️ Langkah Pengembangan Selanjutnya (Next Steps)
+## 💻 Panduan Penggunaan & Kompilasi (CLI Usage)
 
-1. Selesaikan implementasi *handshake* awal menggunakan `snow` di atas `Tokio::net::TcpStream`.
-2. Buat pembungkus *stream* kustom (`NoiseFramedStream`) memanfaatkan `tokio_util::codec::LengthDelimitedCodec` agar pembacaan byte stream tidak bocor atau terpotong.
-3. Rancang modul **Auto-Reconnect Loop** pada *Agent* menggunakan pustaka `tokio::time::sleep`.
-4. Implementasikan pemetaan `HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>` pada sisi pengirim dan penerima untuk memisahkan data Port Forwarding berdasarkan `channel_id`.
-5. Siapkan konfigurasi `Cross` (Kompilasi Silang via Docker) untuk menghasilkan biner `.exe` (Windows) langsung dari mesin pengembang Linux.
+### 1. Kompilasi Release (Statis & Stripped)
+```bash
+cargo build --release
+```
+Biner akan dihasilkan di `target/release/agent` dan `target/release/controller`.
+
+### 2. Membuat Pasangan Kunci 25519
+```bash
+./target/release/controller keygen
+```
+Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex).
+
+### 3. Menjalankan Target Agent
+```bash
+# Mode Listen (Direct Mode)
+./target/release/agent --mode listen --addr 0.0.0.0:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
+
+# Mode Connect (Reverse Connection dengan Auto-Reconnect)
+./target/release/agent --mode connect --addr 127.0.0.1:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
+```
+
+### 4. Menjalankan Perintah dari Controller
+```bash
+# Mengambil Statistik Remote (CPU & RAM)
+./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> stats
+
+# Eksekusi Perintah Terminal
+./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> exec "uname -a"
+
+# Unggah File Berbasis Chunk (32 KB per chunk)
+./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> upload ./file.zip
+
+# Rotasi Kunci Sesi Secara Manual
+./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> rekey
+
+# Local Port Forwarding Multiplexed (SSH -L 8080:80)
+./target/release/controller --addr 127.0.0.1:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-local -L 8080:80
+```
+
+---
+
+## 🏗️ Status Implementasi (Completed ✅)
+
+- [x] **Handshake Awal:** Selesai menggunakan `snow` (`Noise_IK_25519_ChaChaPoly_BLAKE2b`) di atas `tokio::net::TcpStream`.
+- [x] **Stream Framed:** Pembungkus `NoiseFramedStream` memanfaatkan `tokio_util::codec::LengthDelimitedCodec` untuk mencegah fragmentasi data.
+- [x] **Auto-Reconnect Loop:** Modul resiliensi jaringan dengan strategi *Exponential Backoff* (1s - 60s) pada Agent.
+- [x] **Multiplexed Port Forwarding:** Aliran multi-channel (`channel_id`) menggunakan `HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>` yang menumpang di satu koneksi Raw TCP.
+- [x] **Kompilasi Silang & Docker:** Dikonfigurasi via `Cross.toml`, `Dockerfile`, serta GitHub Actions Multi-OS workflow.
+
