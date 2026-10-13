@@ -298,19 +298,36 @@ p[1.2.3.4:9999]> exit
 
 ---
 
-6. **Native Virtual Drive Mounting (WebDAV Explorer Bridge)**
-   * Memasang direktori remote Agent langsung sebagai drive letter (seperti `P:` atau `F:`) di **Windows File Explorer** atau mount point di Linux/macOS.
-   * Mengizinkan drag-and-drop upload, download, membuka, mengedit, dan menghapus file remote seolah-olah drive lokal tanpa instalasi driver pihak ketiga (menggunakan layanan native bawaan `WebClient` Windows).
+### 5. Mode Reverse Connection (`-R` / `--reverse`)
+Jika Server/Target berada di balik **NAT ketat, Firewall, atau Modem Seluler/4G** (tidak memiliki IP publik langsung), gunakan flag `-R`:
+
+1. **Di Laptop/Server Admin (yang dapat menerima koneksi masuk):**
+   ```bash
+   # Buka listener menunggu sambungan dari Agent:
+   ./target/release/p -R
+
+   # Atau tentukan port spesifik jika diinginkan:
+   ./target/release/p -R -p 9999
+   ```
+
+2. **Di Server/Target (Agent):**
+   ```bash
+   # Agent menembus firewall dan menghubung balik ke Laptop Admin:
+   ./target/release/p <IP_LAPTOP_ADMIN>:9999 -R
+   ```
+   *Fitur **Exponential Backoff Auto-Reconnect** bawaan `p` otomatis aktif, sehingga jika koneksi internet terputus, Agent akan terus mencoba terhubung kembali.*
 
 ---
 
 ## 🏗️ Status Implementasi (Completed ✅)
 
-- [x] **Virtual Drive Mounting (Windows Explorer / WebDAV):** Mount remote filesystem langsung ke drive letter Windows (misal `P:`) via `p controller <IP:PORT> mount P:` atau perintah `mount` di dalam interactive shell prompt!
-- [x] **Single Binary Architecture (`p`):** Menggabungkan peran Agent, Controller, dan Keygen ke dalam satu biner tunggal hemat memori dan ukuran (~1.3 MB).
-- [x] **SSH-Style Interactive REPL Shell:** Cukup ketik `p controller <IP:PORT>` untuk langsung masuk ke sesi shell prompt `p[IP:PORT]>` tanpa harus berulang kali mengetik perintah CLI.
-- [x] **Pairing Token & `authorized_controllers`:** Autentikasi password aman pada koneksi pertama dan penyimpanan whitelist otomatis sehingga login berikutnya berlangsung instan.
-- [x] **SSH-Style TOFU Key Discovery:** Otomatis mengambil dan memverifikasi public key Agent pada koneksi pertama serta mencatat di `~/.p/known_agents` tanpa copy-paste manual.
+- [x] **Zero-Friction Unified CLI (`p`):** Mengeliminasi subcommand `p agent` dan `p controller`. Cukup ketik `p` untuk server dan `p <TARGET>` untuk controller.
+- [x] **Reverse Connection Flag (`-R` / `--reverse`):** Target menembus NAT via `p <IP> -R`, dan admin mendengarkan via `p -R`.
+- [x] **Virtual Drive Mounting (Windows Explorer / WebDAV):** Mount remote filesystem langsung ke drive letter Windows (misal `P:`) via `p <IP:PORT> mount P:` atau perintah `mount` di dalam interactive shell prompt!
+- [x] **Single Binary Architecture (`p`):** Menggabungkan seluruh peran ke dalam satu biner tunggal hemat memori dan ukuran (~1.3 MB).
+- [x] **SSH-Style Interactive REPL Shell:** Cukup ketik `p <IP:PORT>` untuk langsung masuk ke sesi shell prompt `p[IP:PORT]>`.
+- [x] **Pairing Token & `authorized_controllers`:** Autentikasi password aman pada koneksi pertama dan penyimpanan whitelist otomatis.
+- [x] **SSH-Style TOFU Key Discovery:** Otomatis mengambil dan memverifikasi public key Agent pada koneksi pertama serta mencatat di `~/.p/known_agents`.
 - [x] **Bi-Directional File Transfer:** Transfer file dua arah yang aman (`upload` & `download`) berbasis chunking 32 KB hemat memori.
 - [x] **Handshake Awal:** Selesai menggunakan `snow` (`Noise_IK_25519_ChaChaPoly_BLAKE2b`) di atas `tokio::net::TcpStream`.
 - [x] **Stream Framed:** Pembungkus `NoiseFramedStream` memanfaatkan `tokio_util::codec::LengthDelimitedCodec` untuk mencegah fragmentasi data.

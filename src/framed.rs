@@ -31,9 +31,8 @@ pub struct NoiseFramedStream {
 }
 
 impl NoiseFramedStream {
-    /// Probe cepat untuk mengunduh kunci publik Agent (TOFU / Trust On First Use)
-    pub async fn discover_remote_pubkey(addr: &str) -> Result<Vec<u8>, FrameError> {
-        let stream = TcpStream::connect(addr).await?;
+    /// Probe stream untuk mengambil public key Agent secara remote jika stream sudah terbuka
+    pub async fn probe_stream_for_pubkey(stream: TcpStream) -> Result<Vec<u8>, FrameError> {
         let mut framed = LengthDelimitedCodec::builder()
             .length_field_length(4)
             .max_frame_length(MAX_MESSAGE_LEN)
@@ -56,13 +55,18 @@ impl NoiseFramedStream {
         }
     }
 
-    /// Inisialisasi koneksi dari sisi Initiator (Client/Controller) dengan Handshake Noise IK
-    pub async fn connect_as_initiator(
-        addr: &str,
+    /// Probe cepat untuk mengunduh kunci publik Agent (TOFU / Trust On First Use)
+    pub async fn discover_remote_pubkey(addr: &str) -> Result<Vec<u8>, FrameError> {
+        let stream = TcpStream::connect(addr).await?;
+        Self::probe_stream_for_pubkey(stream).await
+    }
+
+    /// Inisialisasi Handshake Noise IK dari sisi Initiator menggunakan TcpStream yang sudah terbuka
+    pub async fn handshake_as_initiator(
+        stream: TcpStream,
         local_privkey: &[u8],
         remote_pubkey: &[u8],
     ) -> Result<Self, FrameError> {
-        let stream = TcpStream::connect(addr).await?;
         let mut framed = LengthDelimitedCodec::builder()
             .length_field_length(4)
             .max_frame_length(MAX_MESSAGE_LEN)
@@ -90,6 +94,16 @@ impl NoiseFramedStream {
         let session = NoiseSession::new(transport);
 
         Ok(Self { framed, session })
+    }
+
+    /// Inisialisasi koneksi dari sisi Initiator (Client/Controller) dengan Handshake Noise IK
+    pub async fn connect_as_initiator(
+        addr: &str,
+        local_privkey: &[u8],
+        remote_pubkey: &[u8],
+    ) -> Result<Self, FrameError> {
+        let stream = TcpStream::connect(addr).await?;
+        Self::handshake_as_initiator(stream, local_privkey, remote_pubkey).await
     }
 
     /// Menerima koneksi masuk dari sisi Responder (Agent) dan menyelesaikan Handshake Noise IK

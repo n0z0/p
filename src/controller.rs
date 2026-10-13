@@ -38,6 +38,10 @@ pub struct ControllerArgs {
     #[arg(short = 'k', long)]
     pub agent_pubkey: Option<String>,
 
+    /// Mode listen (Reverse Controller) untuk menunggu Agent yang menghubung balik
+    #[arg(short = 'R', long = "reverse")]
+    pub reverse: bool,
+
     #[command(subcommand)]
     pub command: Option<ControllerCommand>,
 }
@@ -484,46 +488,6 @@ async fn run_interactive_shell(stream: Arc<Mutex<NoiseFramedStream>>, addr: &str
 }
 
 pub async fn run_controller(args: ControllerArgs) -> Result<()> {
-    let target_addr = args
-        .addr
-        .or(args.addr_pos)
-        .unwrap_or_else(|| "127.0.0.1:9999".into());
-
-    let agent_pubkey_bytes = if let Some(hex_str) = &args.agent_pubkey {
-        let bytes = hex::decode(hex_str.trim()).context("Format hex agent_pubkey tidak valid")?;
-        if bytes.len() != 32 {
-            bail!("Panjang agent_pubkey harus 32 byte!");
-        }
-        bytes
-    } else if let Some(saved_key) = lookup_known_agent(&target_addr) {
-        info!("🔑 Kunci publik Agent ditemukan di ~/.p/known_agents untuk {}", target_addr);
-        saved_key
-    } else {
-        println!("🔍 Menghubungi Agent di {} untuk mengambil identitas kunci publik (TOFU)...", target_addr);
-        match NoiseFramedStream::discover_remote_pubkey(&target_addr).await {
-            Ok(discovered_pubkey) => {
-                let fingerprint = compute_key_fingerprint(&discovered_pubkey);
-                let hex_key = hex::encode(&discovered_pubkey);
-                println!("🔒 KUNCI PUBLIK AGENT TERVERIFIKASI (Trust On First Use):");
-                println!("   Host        : {}", target_addr);
-                println!("   Fingerprint : {}", fingerprint);
-                println!("   Public Key  : {}", hex_key);
-                println!("💡 Kunci otomatis disimpan ke ~/.p/known_agents (seperti SSH).");
-                println!();
-                if let Err(e) = save_known_agent(&target_addr, &hex_key) {
-                    warn!("Gagal menyimpan ke known_agents: {}", e);
-                }
-                discovered_pubkey
-            }
-            Err(e) => {
-                bail!(
-                    "Gagal mengambil kunci publik otomatis dari Agent di {}: {}. Pastikan Agent sedang berjalan, atau tentukan secara manual via --agent-pubkey.",
-                    target_addr, e
-                );
-            }
-        }
-    };
-
     let controller_privkey_bytes = match args.privkey {
         Some(hex_str) => {
             let bytes = hex::decode(hex_str.trim()).context("Format hex privkey tidak valid")?;
@@ -564,14 +528,110 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
         }
     };
 
-    info!("🌐 Menghubungkan ke Agent di {}...", target_addr);
-    let mut stream = NoiseFramedStream::connect_as_initiator(
-        &target_addr,
-        &controller_privkey_bytes,
-        &agent_pubkey_bytes,
-    )
-    .await
-    .context("Gagal melakukan handshake terenkripsi Noise ke Agent")?;
+    let (mut stream, target_addr) = if args.reverse {
+        let bind_addr = args.addr.or(args.addr_pos).unwrap_or_else(|| "0.0.0.0:9999".into());
+        println!("⏳ [REVERSE CONTROLLER] Mendengarkan koneksi masuk dari Agent di {} ...", bind_addr);
+        let listener = TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("Gagal bind ke {}", bind_addr))?;
+
+        let (tcp_stream, peer_addr) = listener.accept().await?;
+        println!("🌐 Agent terhubung dari {}!", peer_addr);
+
+        let agent_pubkey_opt = if let Some(hex_str) = &args.agent_pubkey {
+            let bytes = hex::decode(hex_str.trim()).context("Format hex agent_pubkey tidak valid")?;
+            if bytes.len() != 32 {
+                bail!("Panjang agent_pubkey harus 32 byte!");
+            }
+            Some(bytes)
+        } else {
+            lookup_known_agent(&peer_addr.ip().to_string())
+        };
+
+        if let Some(agent_pubkey) = agent_pubkey_opt {
+            let s = NoiseFramedStream::handshake_as_initiator(
+                tcp_stream,
+                &controller_privkey_bytes,
+                &agent_pubkey,
+            )
+            .await
+            .context("Gagal melakukan handshake terenkripsi Noise ke Agent")?;
+            (s, peer_addr.to_string())
+        } else {
+            println!("🔍 Mengambil identitas kunci publik Agent (TOFU)...");
+            let discovered = NoiseFramedStream::probe_stream_for_pubkey(tcp_stream).await
+                .context("Gagal melakukan probe kunci publik Agent")?;
+            let fingerprint = compute_key_fingerprint(&discovered);
+            let hex_key = hex::encode(&discovered);
+            println!("🔒 KUNCI PUBLIK AGENT TERVERIFIKASI (TOFU):");
+            println!("   Peer        : {}", peer_addr);
+            println!("   Fingerprint : {}", fingerprint);
+            println!("   Public Key  : {}", hex_key);
+            println!("💡 Kunci disimpan ke ~/.p/known_agents. Menyelesaikan handshake sesi...");
+            let _ = save_known_agent(&peer_addr.ip().to_string(), &hex_key);
+
+            let (second_tcp, second_peer) = listener.accept().await?;
+            let s = NoiseFramedStream::handshake_as_initiator(
+                second_tcp,
+                &controller_privkey_bytes,
+                &discovered,
+            )
+            .await
+            .context("Gagal melakukan handshake terenkripsi Noise ke Agent")?;
+            (s, second_peer.to_string())
+        }
+    } else {
+        let target_addr = args
+            .addr
+            .or(args.addr_pos)
+            .unwrap_or_else(|| "127.0.0.1:9999".into());
+
+        let agent_pubkey_bytes = if let Some(hex_str) = &args.agent_pubkey {
+            let bytes = hex::decode(hex_str.trim()).context("Format hex agent_pubkey tidak valid")?;
+            if bytes.len() != 32 {
+                bail!("Panjang agent_pubkey harus 32 byte!");
+            }
+            bytes
+        } else if let Some(saved_key) = lookup_known_agent(&target_addr) {
+            info!("🔑 Kunci publik Agent ditemukan di ~/.p/known_agents untuk {}", target_addr);
+            saved_key
+        } else {
+            println!("🔍 Menghubungi Agent di {} untuk mengambil identitas kunci publik (TOFU)...", target_addr);
+            match NoiseFramedStream::discover_remote_pubkey(&target_addr).await {
+                Ok(discovered_pubkey) => {
+                    let fingerprint = compute_key_fingerprint(&discovered_pubkey);
+                    let hex_key = hex::encode(&discovered_pubkey);
+                    println!("🔒 KUNCI PUBLIK AGENT TERVERIFIKASI (Trust On First Use):");
+                    println!("   Host        : {}", target_addr);
+                    println!("   Fingerprint : {}", fingerprint);
+                    println!("   Public Key  : {}", hex_key);
+                    println!("💡 Kunci otomatis disimpan ke ~/.p/known_agents (seperti SSH).");
+                    println!();
+                    if let Err(e) = save_known_agent(&target_addr, &hex_key) {
+                        warn!("Gagal menyimpan ke known_agents: {}", e);
+                    }
+                    discovered_pubkey
+                }
+                Err(e) => {
+                    bail!(
+                        "Gagal mengambil kunci publik otomatis dari Agent di {}: {}. Pastikan Agent sedang berjalan, atau tentukan secara manual via --agent-pubkey.",
+                        target_addr, e
+                    );
+                }
+            }
+        };
+
+        info!("🌐 Menghubungkan ke Agent di {}...", target_addr);
+        let s = NoiseFramedStream::connect_as_initiator(
+            &target_addr,
+            &controller_privkey_bytes,
+            &agent_pubkey_bytes,
+        )
+        .await
+        .context("Gagal melakukan handshake terenkripsi Noise ke Agent")?;
+
+        (s, target_addr)
+    };
 
     info!("🔒 Terhubung dengan aman ke Agent! Memverifikasi status otorisasi...");
 

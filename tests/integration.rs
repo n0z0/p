@@ -859,4 +859,68 @@ async fn test_webdav_server_http_methods() {
     agent_handle.await.unwrap();
 }
 
+#[tokio::test]
+async fn test_reverse_connection_handshake() {
+    let agent_keypair = generate_keypair().unwrap();
+    let controller_keypair = generate_keypair().unwrap();
+
+    // 1. Controller is in listen mode (Reverse Controller)
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let controller_addr = listener.local_addr().unwrap();
+
+    let agent_priv = agent_keypair.private.clone();
+    let agent_pub = agent_keypair.public.clone();
+    let controller_priv = controller_keypair.private.clone();
+
+    // 2. Spawn Controller acceptor
+    let controller_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut controller_framed = NoiseFramedStream::handshake_as_initiator(
+            stream,
+            &controller_priv,
+            &agent_pub,
+        )
+        .await
+        .expect("Reverse Controller handshake failed");
+
+        // Controller sends command
+        controller_framed
+            .send_command(&RemoteCommand::GetSystemStats)
+            .await
+            .unwrap();
+
+        let resp = controller_framed.recv_response().await.unwrap();
+        match resp {
+            CommandResponse::SystemStats { cpu_usage, ram_used_mb } => {
+                assert_eq!(cpu_usage, 42.0);
+                assert_eq!(ram_used_mb, 1024);
+            }
+            _ => panic!("Unexpected response"),
+        }
+    });
+
+    // 3. Agent initiates outbound connection to Controller
+    let agent_tcp = TcpStream::connect(controller_addr).await.unwrap();
+    let mut agent_framed = NoiseFramedStream::accept_as_responder(
+        agent_tcp,
+        &agent_priv,
+        &agent_keypair.public,
+    )
+    .await
+    .expect("Reverse Agent handshake failed");
+
+    let cmd = agent_framed.recv_command().await.unwrap();
+    assert_eq!(cmd, RemoteCommand::GetSystemStats);
+
+    agent_framed
+        .send_response(&CommandResponse::SystemStats {
+            cpu_usage: 42.0,
+            ram_used_mb: 1024,
+        })
+        .await
+        .unwrap();
+
+    controller_handle.await.unwrap();
+}
+
 

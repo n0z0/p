@@ -44,9 +44,11 @@ struct Cli {
     #[arg(long, default_value = "./storage")]
     pub storage_dir: PathBuf,
 
-    /// Paksa berjalan sebagai Agent (misal pada reverse connection)
-    #[arg(long)]
-    pub agent: bool,
+    /// Mode Reverse Connection:
+    /// - Pada target/agent: `p 1.2.3.4:9999 -R` (agent menghubung balik ke controller)
+    /// - Pada controller: `p -R` atau `p -R -p 9999` (controller mendengarkan koneksi masuk dari agent)
+    #[arg(short = 'R', long = "reverse")]
+    pub reverse: bool,
 
     #[command(subcommand)]
     pub command: Option<ControllerCommand>,
@@ -69,24 +71,32 @@ async fn main() -> Result<()> {
     }
 
     // 2. Tentukan peran: Controller vs Agent
-    // Jika ada target atau subcommand (selain mode agent eksplisit), maka jadi Controller.
-    // Jika tidak ada target dan bukan dipaksa jadi controller, maka jadi Agent.
-    let is_controller = !cli.agent && (cli.target.is_some() || cli.command.is_some());
+    // - Jika flag -R aktif dan ada target -> Agent connecting reverse to Controller
+    // - Jika flag -R aktif tanpa target -> Controller listening for reverse Agent
+    // - Jika normal dan ada target / command -> Controller connecting to Agent
+    // - Jika normal tanpa target -> Agent listening
+    let is_controller = if cli.reverse {
+        cli.target.is_none() // Jika tanpa target, Controller yang listen
+    } else {
+        cli.target.is_some() || cli.command.is_some()
+    };
 
     if is_controller {
+        let addr = cli.addr.or_else(|| cli.port.map(|p| format!("0.0.0.0:{}", p)));
         let args = ControllerArgs {
             addr_pos: cli.target,
-            addr: cli.addr,
+            addr,
             token: cli.token,
             privkey: cli.privkey,
             agent_pubkey: cli.agent_pubkey,
+            reverse: cli.reverse,
             command: cli.command,
         };
         run_controller(args).await
     } else {
         // Mode Agent (Server Daemon)
-        let mode = if cli.agent && cli.target.is_some() {
-            "connect".to_string() // Reverse connection
+        let mode = if cli.reverse && cli.target.is_some() {
+            "connect".to_string() // Reverse connection outbound
         } else {
             "listen".to_string()
         };
