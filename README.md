@@ -192,11 +192,31 @@ pub fn execute_os_command(cmd_string: &str) -> Result<String, String> {
 
 ---
 
+## ⚡ Quick Install & Update (Satu Baris Perintah)
+
+Untuk mengunduh, memasang, atau memperbarui `p` ke versi rilis terbaru secara otomatis dan langsung terdaftar di PATH Environment terminal Anda:
+
+### 🪟 Windows (PowerShell)
+Jalankan satu baris perintah ini di PowerShell:
+```powershell
+irm https://raw.githubusercontent.com/n0z0/p/main/install.ps1 | iex
+```
+*(Otomatis mengunduh biner `p.exe` terbaru, menyimpannya di `~/.p/bin`, dan mendaftarkannya ke User PATH sehingga perintah `p` bisa langsung digunakan)*
+
+### 🐧 Linux & 🍏 macOS (Terminal / Shell)
+Jalankan satu baris perintah ini di terminal:
+```bash
+curl -fsSL https://raw.githubusercontent.com/n0z0/p/main/install.sh | bash
+```
+*(Otomatis mendeteksi OS Linux/macOS serta arsitektur x86_64/ARM64, memasang di `~/.local/bin/p`, dan memastikan PATH terdaftar)*
+
+---
+
 ## 💻 Panduan Penggunaan & Kompilasi (Single Binary `p`)
 
 Seluruh fungsi Agent, Controller, dan Keygen tergabung dalam **satu file biner tunggal: `p`** (atau `p.exe`).
 
-### 1. Kompilasi Release (Statis & Stripped)
+### 1. Kompilasi Manual Release dari Source
 ```bash
 cargo build --release
 ```
