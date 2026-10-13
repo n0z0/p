@@ -56,9 +56,9 @@ Untuk memastikan agen siap digunakan di lingkungan produksi yang dinamis, fitur-
    * Jika koneksi TCP terputus akibat gangguan jaringan, *Agent* tidak boleh mati (*crash*).
    * Gunakan strategi **Exponential Backoff** (misal: mencoba kembali dalam waktu 1s, 2s, 4s, hingga maksimal 60s) untuk mencegah serangan *Thundering Herd* pada server pengendali (Controller).
 
-2. **File Transfer Terintegrasi (Chunk-Based)**
-   * Pengiriman file dilakukan langsung melalui jalur Bincode murni dengan membagi file menjadi potongan kecil (*chunking*, misal per 64KB). 
-   * Hal ini mencegah lonjakan memori RAM (*Out of Memory*) pada perangkat IoT atau server kecil saat mentransfer file berukuran besar.
+2. **File Transfer Terintegrasi Dua Arah (Bi-Directional Chunk-Based)**
+   * Pengiriman file dari Controller ke Agent (`upload`) maupun penarikan file dari Agent ke Controller (`download`).
+   * Seluruh proses menggunakan pembagian potongan data (*chunking* 32 KB) dengan verifikasi konfirmasi dan indeks, mencegah lonjakan RAM pada perangkat berdaya rendah.
 
 3. **Periodic Key Rotation (Pemutaran Kunci Berkala)**
    * Untuk meminimalkan dampak jika terjadi kebocoran kunci enkripsi sesi, sistem wajib melakukan *re-keying* secara otomatis.
@@ -67,6 +67,10 @@ Untuk memastikan agen siap digunakan di lingkungan produksi yang dinamis, fitur-
 4. **Multiplexed Port Forwarding (Local & Reverse Tunneling)**
    * Sistem harus mendukung fungsionalitas tunneling seperti SSH `-L` (Local Forwarding) dan `-R` (Reverse Forwarding).
    * Seluruh lalu lintas data port forwarding tidak boleh membuka port internet baru. Data wajib "menumpang" di dalam satu koneksi Raw TCP Noise utama (Multiplexing) menggunakan identifikasi `channel_id`.
+
+5. **Manajemen Kunci Praktis Bergaya SSH (TOFU - Trust On First Use)**
+   * **Host Key Persisten:** Agent dan Controller secara otomatis membuat dan menyimpan kunci host permanen di `~/.p/agent.key` dan `~/.p/controller.key` sehingga tidak berganti-ganti setiap restart.
+   * **Auto-Discovery Kunci Publik:** Controller tidak mewajibkan copy-paste 64-karakter hex key secara manual. Saat pertama kali terhubung tanpa `--agent-pubkey`, Controller melakukan probe penemuan kunci publik secara instan, memverifikasi *Fingerprint (SHA-256)*, dan menyimpannya ke `~/.p/known_agents` persis seperti cara kerja OpenSSH!
 
 ---
 
@@ -206,37 +210,45 @@ Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex)
 
 ### 3. Menjalankan Mode Agent (di Server / VPS / IoT)
 ```bash
-# Mode Listen (Direct Mode)
-./target/release/p agent --mode listen --addr 0.0.0.0:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
+# Otomatis: host key dibuat/dimuat persisten di ~/.p/agent.key
+./target/release/p agent --mode listen --addr 0.0.0.0:9999
 
 # Mode Connect (Reverse Connection dengan Auto-Reconnect)
-./target/release/p agent --mode connect --addr 1.2.3.4:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
+./target/release/p agent --mode connect --addr 1.2.3.4:9999
+
+# Atau tentukan private key custom manual jika diinginkan
+./target/release/p agent --mode listen --addr 0.0.0.0:9999 --privkey <AGENT_PRIVATE_KEY_HEX>
 ```
 
 ### 4. Menjalankan Perintah dari Controller (di Laptop / PC Admin)
+> **Fitur SSH-Style TOFU:** Parameter `--agent-pubkey` bersifat **opsional**. Jika diabaikan, Controller otomatis mengunduh kunci publik Agent, memverifikasi fingerprint SHA-256, dan menyimpannya ke `~/.p/known_agents`!
+
 ```bash
 # Mengambil Statistik Remote (CPU & RAM)
-./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> stats
+./target/release/p controller --addr 1.2.3.4:9999 stats
 
 # Eksekusi Perintah Terminal OS Jarak Jauh
-./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> exec "uname -a"
+./target/release/p controller --addr 1.2.3.4:9999 exec "uname -a"
 
-# Unggah File Berbasis Chunk (32 KB per chunk)
-./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> upload ./file.zip
+# Unggah File Lokal ke Agent (Chunk 32 KB)
+./target/release/p controller --addr 1.2.3.4:9999 upload ./file.zip
+
+# Unduh File Remote dari Agent ke Mesin Lokal (Chunk 32 KB)
+./target/release/p controller --addr 1.2.3.4:9999 download /var/log/syslog ./syslog.log
 
 # Rotasi Kunci Sesi Secara Manual
-./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> rekey
+./target/release/p controller --addr 1.2.3.4:9999 rekey
 
 # Local Port Forwarding Multiplexed (SSH -L 8080:80)
 # Membuka layanan remote di Agent (port 80) agar bisa diakses di laptop Controller (port 8080)
-./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-local -L 8080:80
+./target/release/p controller --addr 1.2.3.4:9999 forward-local -L 8080:80
 
 # Remote Port Forwarding Multiplexed (SSH -R 9090:8080)
 # Membuka aplikasi lokal di Controller (port 8080) agar bisa diakses dari sisi Agent (port 9090)
-./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> forward-remote -R 9090:8080
+./target/release/p controller --addr 1.2.3.4:9999 forward-remote -R 9090:8080
 
 # Matikan Perangkat Jarak Jauh
-./target/release/p controller --addr 1.2.3.4:9999 --agent-pubkey <AGENT_PUBLIC_KEY_HEX> shutdown
+./target/release/p controller --addr 1.2.3.4:9999 shutdown
 ```
 
 ---
@@ -244,10 +256,13 @@ Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex)
 ## 🏗️ Status Implementasi (Completed ✅)
 
 - [x] **Single Binary Architecture (`p`):** Menggabungkan peran Agent, Controller, dan Keygen ke dalam satu biner tunggal hemat memori dan ukuran (~1.3 MB).
+- [x] **SSH-Style TOFU Key Discovery:** Otomatis mengambil dan memverifikasi public key Agent pada koneksi pertama serta mencatat di `~/.p/known_agents` tanpa copy-paste manual.
+- [x] **Bi-Directional File Transfer:** Transfer file dua arah yang aman (`upload` & `download`) berbasis chunking 32 KB hemat memori.
 - [x] **Handshake Awal:** Selesai menggunakan `snow` (`Noise_IK_25519_ChaChaPoly_BLAKE2b`) di atas `tokio::net::TcpStream`.
 - [x] **Stream Framed:** Pembungkus `NoiseFramedStream` memanfaatkan `tokio_util::codec::LengthDelimitedCodec` untuk mencegah fragmentasi data.
 - [x] **Auto-Reconnect Loop:** Modul resiliensi jaringan dengan strategi *Exponential Backoff* (1s - 60s) pada Agent.
 - [x] **Local Port Forwarding (-L):** Aliran multi-channel (`channel_id`) menggunakan `HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>` yang menumpang di satu koneksi Raw TCP.
 - [x] **Remote Port Forwarding (-R / Reverse Tunneling):** Membuka layanan/aplikasi internal Controller agar dapat diakses langsung oleh perangkat/klien di sisi Agent melalui tunnel terenkripsi Noise.
 - [x] **Kompilasi Silang & Docker:** Dikonfigurasi via `Dockerfile` serta GitHub Actions Multi-OS workflow untuk Windows, Linux, dan macOS.
+
 

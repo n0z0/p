@@ -105,3 +105,98 @@ impl NoiseSession {
         self.created_at.elapsed().as_secs()
     }
 }
+
+pub const DISCOVERY_MAGIC_REQ: &[u8] = b"P_DISCOVERY_REQ_V1\0";
+pub const DISCOVERY_MAGIC_RESP: &[u8] = b"P_DISCOVERY_RESP_V1\0";
+
+/// Menghitung sidik jari (fingerprint) SHA256 dari kunci publik
+pub fn compute_key_fingerprint(pubkey: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(pubkey);
+    let result = hasher.finalize();
+    format!("SHA256:{}", hex::encode(result))
+}
+
+/// Mendapatkan folder konfigurasi p (~/.p)
+pub fn get_config_dir() -> std::path::PathBuf {
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        std::path::PathBuf::from(userprofile).join(".p")
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".p")
+    } else {
+        std::env::temp_dir().join(".p")
+    }
+}
+
+/// Memuat atau membuat kunci host persisten milik Agent (~/.p/agent.key)
+pub fn load_or_create_agent_key() -> Result<Keypair, CryptoError> {
+    let dir = get_config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let key_file = dir.join("agent.key");
+    let pub_file = dir.join("agent.pub");
+
+    if key_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&key_file) {
+            if let Ok(privkey) = hex::decode(content.trim()) {
+                if privkey.len() == 32 {
+                    let pubkey = if pub_file.exists() {
+                        hex::decode(std::fs::read_to_string(&pub_file).unwrap_or_default().trim()).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(Keypair {
+                        private: privkey,
+                        public: pubkey,
+                    });
+                }
+            }
+        }
+    }
+
+    // Buat kunci baru dan simpan
+    let keypair = generate_keypair()?;
+    let _ = std::fs::write(&key_file, hex::encode(&keypair.private));
+    let _ = std::fs::write(&pub_file, hex::encode(&keypair.public));
+    Ok(keypair)
+}
+
+/// Mencari kunci publik yang sudah dikenal untuk suatu alamat di ~/.p/known_agents
+pub fn lookup_known_agent(addr: &str) -> Option<Vec<u8>> {
+    let known_file = get_config_dir().join("known_agents");
+    if !known_file.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(known_file).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((saved_addr, key_hex)) = line.split_once('=') {
+            if saved_addr.trim() == addr.trim() {
+                if let Ok(bytes) = hex::decode(key_hex.trim()) {
+                    if bytes.len() == 32 {
+                        return Some(bytes);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Menyimpan kunci publik Agent ke ~/.p/known_agents (TOFU)
+pub fn save_known_agent(addr: &str, pubkey_hex: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = get_config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let known_file = dir.join("known_agents");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(known_file)?;
+    writeln!(file, "{}={}", addr.trim(), pubkey_hex.trim())?;
+    Ok(())
+}
+

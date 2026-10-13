@@ -16,10 +16,11 @@ async fn test_noise_handshake_and_command_exchange() {
     let agent_pub = agent_keypair.public.clone();
     let controller_priv = controller_keypair.private.clone();
 
+    let agent_pub_for_acceptor = agent_pub.clone();
     // Spawn Agent acceptor
     let agent_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv)
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_acceptor)
             .await
             .expect("Agent handshake failed");
 
@@ -122,10 +123,11 @@ async fn test_chunked_file_transfer() {
 
     let test_data = vec![0xABu8; 150_000]; // 150 KB test payload
     let test_data_clone = test_data.clone();
+    let agent_pub_for_acceptor = agent_pub.clone();
 
     let agent_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv).await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_acceptor).await.unwrap();
 
         // Expect StartFileTransfer
         let start_cmd = framed.recv_command().await.unwrap();
@@ -217,9 +219,10 @@ async fn test_multiplexed_port_forwarding() {
     let controller_priv = controller_keypair.private.clone();
 
     // Agent handler
+    let agent_pub_for_acceptor = agent_pub.clone();
     let agent_handle = tokio::spawn(async move {
         let (stream, _) = main_listener.accept().await.unwrap();
-        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv).await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_acceptor).await.unwrap();
         let channel_id_expected = 101u32;
         // Expect OpenForwardChannel
         let open_cmd = framed.recv_command().await.unwrap();
@@ -330,9 +333,10 @@ async fn test_remote_port_forwarding() {
     let agent_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let agent_bound_port = agent_listener.local_addr().unwrap().port();
 
+    let agent_pub_for_acceptor = agent_pub.clone();
     let agent_handle = tokio::spawn(async move {
         let (stream, _) = main_listener.accept().await.unwrap();
-        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv).await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_acceptor).await.unwrap();
 
         // Expect StartRemoteForward
         let cmd = framed.recv_command().await.unwrap();
@@ -436,3 +440,118 @@ async fn test_remote_port_forwarding() {
     client_task.await.unwrap();
     agent_handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_ssh_style_tofu_discovery() {
+    let agent_keypair = generate_keypair().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let agent_priv = agent_keypair.private.clone();
+    let agent_pub = agent_keypair.public.clone();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub).await;
+    });
+
+    let discovered = NoiseFramedStream::discover_remote_pubkey(&addr.to_string())
+        .await
+        .expect("Discovery failed");
+    assert_eq!(discovered, agent_keypair.public);
+}
+
+#[tokio::test]
+async fn test_download_file_transfer() {
+    let agent_keypair = generate_keypair().unwrap();
+    let controller_keypair = generate_keypair().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let agent_priv = agent_keypair.private.clone();
+    let agent_pub = agent_keypair.public.clone();
+    let controller_priv = controller_keypair.private.clone();
+
+    let fake_agent_file_content = vec![0x33u8; 100_000]; // 100 KB payload
+    let fake_agent_file_content_clone = fake_agent_file_content.clone();
+    let agent_pub_for_acceptor = agent_pub.clone();
+
+    let agent_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_acceptor)
+            .await
+            .unwrap();
+
+        // 1. Recv StartDownload
+        let cmd = framed.recv_command().await.unwrap();
+        let total_chunks = match cmd {
+            RemoteCommand::StartDownload { filepath } => {
+                assert_eq!(filepath, "dummy.txt");
+                const CHUNK_SIZE: usize = 32 * 1024;
+                let chunks = ((fake_agent_file_content_clone.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+                framed.send_response(&CommandResponse::DownloadHeader {
+                    filename: "dummy.txt".into(),
+                    total_chunks: chunks,
+                    file_size: fake_agent_file_content_clone.len() as u64,
+                }).await.unwrap();
+                chunks
+            }
+            _ => panic!("Expected StartDownload"),
+        };
+
+        // 2. Respond to chunks
+        for _ in 0..total_chunks {
+            match framed.recv_command().await {
+                Ok(RemoteCommand::RequestDownloadChunk { chunk_index }) => {
+                    const CHUNK_SIZE: usize = 32 * 1024;
+                    let start = (chunk_index as usize) * CHUNK_SIZE;
+                    let end = std::cmp::min(start + CHUNK_SIZE, fake_agent_file_content_clone.len());
+                    let slice = fake_agent_file_content_clone[start..end].to_vec();
+                    framed.send_response(&CommandResponse::DownloadChunk {
+                        chunk_index,
+                        data: slice,
+                    }).await.unwrap();
+                }
+                other => panic!("Expected RequestDownloadChunk, got {:?}", other),
+            }
+        }
+    });
+
+    let mut controller = NoiseFramedStream::connect_as_initiator(
+        &addr.to_string(),
+        &controller_priv,
+        &agent_pub,
+    )
+    .await
+    .unwrap();
+
+    controller.send_command(&RemoteCommand::StartDownload {
+        filepath: "dummy.txt".into(),
+    }).await.unwrap();
+
+    let header = controller.recv_response().await.unwrap();
+    let total_chunks = match header {
+        CommandResponse::DownloadHeader { total_chunks, file_size, .. } => {
+            assert_eq!(file_size, 100_000);
+            total_chunks
+        }
+        _ => panic!("Expected DownloadHeader"),
+    };
+
+    let mut downloaded_bytes = Vec::new();
+    for idx in 0..total_chunks {
+        controller.send_command(&RemoteCommand::RequestDownloadChunk { chunk_index: idx }).await.unwrap();
+        match controller.recv_response().await.unwrap() {
+            CommandResponse::DownloadChunk { chunk_index, data } => {
+                assert_eq!(chunk_index, idx);
+                downloaded_bytes.extend_from_slice(&data);
+            }
+            _ => panic!("Expected DownloadChunk"),
+        }
+    }
+
+    assert_eq!(downloaded_bytes, fake_agent_file_content);
+    agent_handle.await.unwrap();
+}
+

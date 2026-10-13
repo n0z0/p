@@ -9,6 +9,8 @@ pub enum RemoteCommand {
     // Fitur Transfer File (Chunk-Based)
     StartFileTransfer { filename: String, total_chunks: u32 },
     WriteFileChunk { chunk_index: u32, data: Vec<u8> },
+    StartDownload { filepath: String },
+    RequestDownloadChunk { chunk_index: u32 },
 
     // Fitur Pemutaran Kunci (Key Rotation)
     RequestKeyRotation,
@@ -29,6 +31,11 @@ pub enum CommandResponse {
     SystemStats { cpu_usage: f32, ram_used_mb: u64 },
     FileChunkAck { chunk_index: u32, success: bool },
     KeyRotationReady,
+
+    // Respons Unduh File (Download)
+    DownloadHeader { filename: String, total_chunks: u32, file_size: u64 },
+    DownloadChunk { chunk_index: u32, data: Vec<u8> },
+    DownloadError(String),
 
     // Respons Port Forwarding
     ForwardChannelAck { channel_id: u32, opened: bool },

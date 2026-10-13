@@ -5,7 +5,10 @@ use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use thiserror::Error;
 
-use crate::crypto::{create_initiator, create_responder, CryptoError, NoiseSession, MAX_MESSAGE_LEN};
+use crate::crypto::{
+    create_initiator, create_responder, CryptoError, NoiseSession, DISCOVERY_MAGIC_REQ,
+    DISCOVERY_MAGIC_RESP, MAX_MESSAGE_LEN,
+};
 use crate::protocol::{CommandResponse, RemoteCommand};
 
 #[derive(Error, Debug)]
@@ -28,6 +31,31 @@ pub struct NoiseFramedStream {
 }
 
 impl NoiseFramedStream {
+    /// Probe cepat untuk mengunduh kunci publik Agent (TOFU / Trust On First Use)
+    pub async fn discover_remote_pubkey(addr: &str) -> Result<Vec<u8>, FrameError> {
+        let stream = TcpStream::connect(addr).await?;
+        let mut framed = LengthDelimitedCodec::builder()
+            .length_field_length(4)
+            .max_frame_length(MAX_MESSAGE_LEN)
+            .new_framed(stream);
+
+        framed.send(Bytes::from_static(DISCOVERY_MAGIC_REQ)).await?;
+
+        let resp_frame = framed
+            .next()
+            .await
+            .ok_or(FrameError::ConnectionClosed)??;
+
+        if resp_frame.starts_with(DISCOVERY_MAGIC_RESP)
+            && resp_frame.len() == DISCOVERY_MAGIC_RESP.len() + 32
+        {
+            let pubkey = resp_frame[DISCOVERY_MAGIC_RESP.len()..].to_vec();
+            Ok(pubkey)
+        } else {
+            Err(FrameError::InvalidHandshake)
+        }
+    }
+
     /// Inisialisasi koneksi dari sisi Initiator (Client/Controller) dengan Handshake Noise IK
     pub async fn connect_as_initiator(
         addr: &str,
@@ -68,19 +96,28 @@ impl NoiseFramedStream {
     pub async fn accept_as_responder(
         stream: TcpStream,
         local_privkey: &[u8],
+        local_pubkey: &[u8],
     ) -> Result<Self, FrameError> {
         let mut framed = LengthDelimitedCodec::builder()
             .length_field_length(4)
             .max_frame_length(MAX_MESSAGE_LEN)
             .new_framed(stream);
 
-        let mut responder = create_responder(local_privkey)?;
-
         // Pesan 1 Handshake: Initiator -> Responder
         let msg1_frame = framed
             .next()
             .await
             .ok_or(FrameError::ConnectionClosed)??;
+
+        // Cek jika ini permintaan discovery kunci publik (TOFU Probe)
+        if msg1_frame.as_ref() == DISCOVERY_MAGIC_REQ {
+            let mut reply = DISCOVERY_MAGIC_RESP.to_vec();
+            reply.extend_from_slice(local_pubkey);
+            let _ = framed.send(Bytes::from(reply)).await;
+            return Err(FrameError::ConnectionClosed);
+        }
+
+        let mut responder = create_responder(local_privkey)?;
         let mut payload_buf = vec![0u8; MAX_MESSAGE_LEN];
         responder
             .read_message(&msg1_frame, &mut payload_buf)

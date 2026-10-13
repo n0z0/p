@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
-use crate::crypto::generate_keypair;
+use crate::crypto::{compute_key_fingerprint, load_or_create_agent_key};
 use crate::framed::NoiseFramedStream;
 use crate::os::{execute_os_command, get_system_stats, shutdown_system};
 use crate::protocol::{CommandResponse, RemoteCommand};
@@ -25,7 +25,7 @@ pub struct AgentArgs {
     #[arg(short, long, default_value = "0.0.0.0:9999")]
     pub addr: String,
 
-    /// Kunci privat statis dalam format heksadesimal (32-byte). Jika kosong, kunci acak akan dibuat
+    /// Kunci privat statis dalam format heksadesimal (32-byte). Jika kosong, kunci persisten ~/.p/agent.key akan digunakan
     #[arg(short, long)]
     pub privkey: Option<String>,
 
@@ -54,30 +54,32 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         .await
         .context("Gagal membuat direktori storage")?;
 
-    let privkey_bytes = match &args.privkey {
+    let (privkey_bytes, pubkey_bytes) = match &args.privkey {
         Some(hex_str) => {
             let bytes = hex::decode(hex_str.trim()).context("Format hex privkey tidak valid")?;
             if bytes.len() != 32 {
                 bail!("Panjang privkey harus tepat 32 byte!");
             }
-            bytes
+            (bytes, Vec::new())
         }
         None => {
-            let keypair = generate_keypair().context("Gagal membuat pasangan kunci")?;
-            println!("🔑 Pasangan Kunci Baru Dibuat:");
-            println!("   Public Key  (Pasang di Controller) : {}", hex::encode(&keypair.public));
-            println!("   Private Key (Simpan di Agent)      : {}", hex::encode(&keypair.private));
+            let keypair = load_or_create_agent_key().context("Gagal memuat atau membuat kunci host persisten")?;
+            let fingerprint = compute_key_fingerprint(&keypair.public);
+            println!("🔑 Kunci Host Agent Persisten (~/.p/agent.key):");
+            println!("   Public Key  : {}", hex::encode(&keypair.public));
+            println!("   Fingerprint : {}", fingerprint);
+            println!("   SSH-Style   : Controller dapat otomatis mendeteksi & menyimpan kunci ini (TOFU)!");
             println!();
-            keypair.private
+            (keypair.private, keypair.public)
         }
     };
 
     match args.mode.to_lowercase().as_str() {
         "listen" => {
-            run_listen_loop(&args, &privkey_bytes).await?;
+            run_listen_loop(&args, &privkey_bytes, &pubkey_bytes).await?;
         }
         "connect" => {
-            run_reconnect_loop(&args, &privkey_bytes).await?;
+            run_reconnect_loop(&args, &privkey_bytes, &pubkey_bytes).await?;
         }
         other => {
             bail!("Mode tidak dikenal '{}'. Gunakan 'listen' atau 'connect'.", other);
@@ -87,7 +89,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_listen_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
+async fn run_listen_loop(args: &AgentArgs, privkey: &[u8], pubkey: &[u8]) -> Result<()> {
     let listener = TcpListener::bind(&args.addr)
         .await
         .with_context(|| format!("Gagal bind ke {}", args.addr))?;
@@ -99,12 +101,13 @@ async fn run_listen_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
             Ok((stream, peer_addr)) => {
                 info!("🌐 Koneksi masuk dari {}", peer_addr);
                 let privkey_clone = privkey.to_vec();
+                let pubkey_clone = pubkey.to_vec();
                 let storage_dir = args.storage_dir.clone();
                 let rot_secs = args.key_rotation_secs;
                 let rot_bytes = args.key_rotation_bytes;
 
                 tokio::spawn(async move {
-                    match NoiseFramedStream::accept_as_responder(stream, &privkey_clone).await {
+                    match NoiseFramedStream::accept_as_responder(stream, &privkey_clone, &pubkey_clone).await {
                         Ok(framed) => {
                             info!("🔒 Handshake Noise IK sukses dengan {}", peer_addr);
                             if let Err(e) = handle_session(framed, storage_dir, rot_secs, rot_bytes).await {
@@ -112,7 +115,8 @@ async fn run_listen_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            warn!("❌ Handshake gagal dari {}: {}", peer_addr, e);
+                            // Jika sekadar probe discovery TOFU atau disconnect biasa, jangan anggap error fatal
+                            info!("Koneksi selesai dari {}: {}", peer_addr, e);
                         }
                     }
                 });
@@ -124,7 +128,7 @@ async fn run_listen_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
     }
 }
 
-async fn run_reconnect_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
+async fn run_reconnect_loop(args: &AgentArgs, privkey: &[u8], pubkey: &[u8]) -> Result<()> {
     let mut backoff = 1u64;
     let max_backoff = 60u64;
 
@@ -133,7 +137,7 @@ async fn run_reconnect_loop(args: &AgentArgs, privkey: &[u8]) -> Result<()> {
         match TcpStream::connect(&args.addr).await {
             Ok(stream) => {
                 info!("🌐 Koneksi TCP terbuka ke {}. Memulai Noise handshake...", args.addr);
-                match NoiseFramedStream::accept_as_responder(stream, privkey).await {
+                match NoiseFramedStream::accept_as_responder(stream, privkey, pubkey).await {
                     Ok(framed) => {
                         info!("🔒 Handshake terenkripsi sukses!");
                         backoff = 1;
@@ -175,6 +179,7 @@ async fn handle_session(
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<CommandResponse>(128);
 
     let mut current_file: Option<FileTransferState> = None;
+    let mut current_download: Option<File> = None;
 
     loop {
         if stream.needs_rekey(key_rotation_secs, key_rotation_bytes) {
@@ -279,6 +284,50 @@ async fn handle_session(
                             }
                         }
                         stream.send_response(&CommandResponse::FileChunkAck { chunk_index, success }).await?;
+                    }
+
+                    RemoteCommand::StartDownload { filepath } => {
+                        info!("📤 Permintaan unduh file diterima: {}", filepath);
+                        let path = PathBuf::from(&filepath);
+                        match File::open(&path).await {
+                            Ok(file) => {
+                                match file.metadata().await {
+                                    Ok(meta) => {
+                                        let file_size = meta.len();
+                                        let total_chunks = ((file_size + 32768 - 1) / 32768) as u32;
+                                        let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        current_download = Some(file);
+                                        stream.send_response(&CommandResponse::DownloadHeader {
+                                            filename,
+                                            total_chunks,
+                                            file_size,
+                                        }).await?;
+                                    }
+                                    Err(e) => {
+                                        stream.send_response(&CommandResponse::DownloadError(format!("Gagal membaca metadata: {}", e))).await?;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::DownloadError(format!("File tidak ditemukan atau gagal dibuka: {}", e))).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::RequestDownloadChunk { chunk_index } => {
+                        let mut chunk_data = Vec::new();
+                        if let Some(file) = &mut current_download {
+                            use tokio::io::AsyncSeekExt;
+                            let offset = chunk_index as u64 * 32768;
+                            if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                                let mut buf = vec![0u8; 32768];
+                                if let Ok(n) = file.read(&mut buf).await {
+                                    buf.truncate(n);
+                                    chunk_data = buf;
+                                }
+                            }
+                        }
+                        stream.send_response(&CommandResponse::DownloadChunk { chunk_index, data: chunk_data }).await?;
                     }
 
                     RemoteCommand::RequestKeyRotation => {

@@ -9,7 +9,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::crypto::generate_keypair;
+use crate::crypto::{
+    compute_key_fingerprint, generate_keypair, get_config_dir, lookup_known_agent,
+    save_known_agent,
+};
 use crate::framed::NoiseFramedStream;
 use crate::protocol::{CommandResponse, RemoteCommand};
 
@@ -19,12 +22,12 @@ pub struct ControllerArgs {
     #[arg(short, long, default_value = "127.0.0.1:9999")]
     pub addr: String,
 
-    /// Kunci privat statis Controller (32-byte hex). Jika kosong, kunci sementara dibuat
+    /// Kunci privat statis Controller (32-byte hex). Jika kosong, kunci persisten ~/.p/controller.key digunakan
     #[arg(long)]
     pub privkey: Option<String>,
 
-    /// Kunci publik statis milik Target Agent (32-byte hex)
-    #[arg(short, long)]
+    /// Kunci publik statis milik Target Agent (32-byte hex). Jika kosong, otomatis diambil via SSH-Style TOFU
+    #[arg(short = 'k', long)]
     pub agent_pubkey: Option<String>,
 
     #[command(subcommand)]
@@ -46,6 +49,14 @@ pub enum ControllerCommand {
     Upload {
         /// Path file lokal yang akan diunggah
         filepath: PathBuf,
+    },
+
+    /// Mengunduh file dari Agent ke Controller
+    Download {
+        /// Path file di mesin Agent yang ingin diunduh
+        remote_path: String,
+        /// Path file/folder lokal tujuan penyimpanan
+        local_path: PathBuf,
     },
 
     /// Rotasi kunci sesi secara manual
@@ -72,16 +83,38 @@ pub enum ControllerCommand {
 const CHUNK_SIZE: usize = 32 * 1024; // 32 KB per chunk
 
 pub async fn run_controller(args: ControllerArgs) -> Result<()> {
-    let agent_pubkey_bytes = match args.agent_pubkey {
-        Some(hex_str) => {
-            let bytes = hex::decode(hex_str.trim()).context("Format hex agent_pubkey tidak valid")?;
-            if bytes.len() != 32 {
-                bail!("Panjang agent_pubkey harus 32 byte!");
-            }
-            bytes
+    let agent_pubkey_bytes = if let Some(hex_str) = &args.agent_pubkey {
+        let bytes = hex::decode(hex_str.trim()).context("Format hex agent_pubkey tidak valid")?;
+        if bytes.len() != 32 {
+            bail!("Panjang agent_pubkey harus 32 byte!");
         }
-        None => {
-            bail!("Parameter --agent-pubkey (32-byte hex) wajib disertakan untuk handshake Noise IK!");
+        bytes
+    } else if let Some(saved_key) = lookup_known_agent(&args.addr) {
+        info!("🔑 Kunci publik Agent ditemukan di ~/.p/known_agents untuk {}", args.addr);
+        saved_key
+    } else {
+        println!("🔍 Menghubungi Agent di {} untuk mengambil identitas kunci publik (TOFU)...", args.addr);
+        match NoiseFramedStream::discover_remote_pubkey(&args.addr).await {
+            Ok(discovered_pubkey) => {
+                let fingerprint = compute_key_fingerprint(&discovered_pubkey);
+                let hex_key = hex::encode(&discovered_pubkey);
+                println!("🔒 KUNCI PUBLIK AGENT TERVERIFIKASI (Trust On First Use):");
+                println!("   Host        : {}", args.addr);
+                println!("   Fingerprint : {}", fingerprint);
+                println!("   Public Key  : {}", hex_key);
+                println!("💡 Kunci otomatis disimpan ke ~/.p/known_agents (seperti SSH).");
+                println!();
+                if let Err(e) = save_known_agent(&args.addr, &hex_key) {
+                    warn!("Gagal menyimpan ke known_agents: {}", e);
+                }
+                discovered_pubkey
+            }
+            Err(e) => {
+                bail!(
+                    "Gagal mengambil kunci publik otomatis dari Agent di {}: {}. Pastikan Agent sedang berjalan, atau tentukan secara manual via --agent-pubkey.",
+                    args.addr, e
+                );
+            }
         }
     };
 
@@ -94,9 +127,34 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
             bytes
         }
         None => {
-            let kp = generate_keypair()?;
-            info!("Menggunakan kunci Controller sementara: {}", hex::encode(&kp.public));
-            kp.private
+            let config_dir = get_config_dir();
+            let c_key_file = config_dir.join("controller.key");
+            if c_key_file.exists() {
+                if let Ok(c) = std::fs::read_to_string(&c_key_file) {
+                    if let Ok(b) = hex::decode(c.trim()) {
+                        if b.len() == 32 {
+                            b
+                        } else {
+                            let kp = generate_keypair()?;
+                            let _ = std::fs::write(&c_key_file, hex::encode(&kp.private));
+                            kp.private
+                        }
+                    } else {
+                        let kp = generate_keypair()?;
+                        let _ = std::fs::write(&c_key_file, hex::encode(&kp.private));
+                        kp.private
+                    }
+                } else {
+                    let kp = generate_keypair()?;
+                    let _ = std::fs::write(&c_key_file, hex::encode(&kp.private));
+                    kp.private
+                }
+            } else {
+                let _ = std::fs::create_dir_all(&config_dir);
+                let kp = generate_keypair()?;
+                let _ = std::fs::write(&c_key_file, hex::encode(&kp.private));
+                kp.private
+            }
         }
     };
 
@@ -209,6 +267,89 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
             }
 
             println!("\n✅ File berhasil diunggah secara utuh!");
+        }
+
+        ControllerCommand::Download { remote_path, local_path } => {
+            println!("📥 Meminta unduh file '{}' dari Agent...", remote_path);
+            stream
+                .send_command(&RemoteCommand::StartDownload {
+                    filepath: remote_path.clone(),
+                })
+                .await?;
+
+            let header_resp = stream.recv_response().await?;
+            let (filename, total_chunks, file_size) = match header_resp {
+                CommandResponse::DownloadHeader {
+                    filename,
+                    total_chunks,
+                    file_size,
+                } => (filename, total_chunks, file_size),
+                CommandResponse::DownloadError(err) => {
+                    bail!("Agent menolak permintaan unduh: {}", err);
+                }
+                other => bail!("Respons tak terduga saat inisiasi unduh: {:?}", other),
+            };
+
+            let target_path = if local_path.is_dir() {
+                local_path.join(&filename)
+            } else {
+                local_path
+            };
+
+            if let Some(parent) = target_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+            }
+
+            let mut dest_file = File::create(&target_path)
+                .await
+                .with_context(|| format!("Gagal membuat file lokal: {}", target_path.display()))?;
+
+            println!(
+                "📥 Mengunduh file '{}' ({} byte, {} chunks)...",
+                filename, file_size, total_chunks
+            );
+
+            for chunk_idx in 0..total_chunks {
+                stream
+                    .send_command(&RemoteCommand::RequestDownloadChunk {
+                        chunk_index: chunk_idx,
+                    })
+                    .await?;
+
+                let chunk_resp = stream.recv_response().await?;
+                match chunk_resp {
+                    CommandResponse::DownloadChunk {
+                        chunk_index,
+                        data,
+                    } => {
+                        if chunk_index != chunk_idx {
+                            bail!(
+                                "Indeks chunk tidak cocok: diharapkan {}, diterima {}",
+                                chunk_idx,
+                                chunk_index
+                            );
+                        }
+                        dest_file.write_all(&data).await?;
+                    }
+                    CommandResponse::DownloadError(err) => {
+                        bail!("Error saat mengunduh chunk {}: {}", chunk_idx, err);
+                    }
+                    other => bail!("Respons tak terduga saat meminta chunk {}: {:?}", chunk_idx, other),
+                }
+
+                let percent = ((chunk_idx + 1) as f32 / total_chunks as f32) * 100.0;
+                print!(
+                    "\r⏳ Mengunduh: chunk {}/{} ({:.1}%)",
+                    chunk_idx + 1,
+                    total_chunks,
+                    percent
+                );
+            }
+
+            dest_file.flush().await?;
+            println!("\n✅ File berhasil diunduh ke: {}", target_path.display());
         }
 
         ControllerCommand::Rekey => {
