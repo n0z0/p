@@ -626,4 +626,237 @@ async fn test_pairing_token_authentication() {
     agent_handle.await.unwrap();
 }
 
+#[tokio::test]
+async fn test_filesystem_remote_commands() {
+    let agent_keypair = generate_keypair().unwrap();
+    let controller_keypair = generate_keypair().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let agent_priv = agent_keypair.private.clone();
+    let agent_pub = agent_keypair.public.clone();
+    let controller_priv = controller_keypair.private.clone();
+
+    let temp_dir = std::env::temp_dir().join(format!("p_fs_test_{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let temp_dir_clone = temp_dir.clone();
+
+    let agent_pub_for_acceptor = agent_pub.clone();
+    let agent_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_acceptor).await.unwrap();
+
+        // 1. Write file
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::FsWriteFile { path, data, truncate: _ } => {
+                let file_path = temp_dir_clone.join(path);
+                std::fs::write(&file_path, data).unwrap();
+                framed.send_response(&CommandResponse::FsOpResult { success: true, error: None }).await.unwrap();
+            }
+            _ => panic!("Expected FsWriteFile"),
+        }
+
+        // 2. Read file
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::FsReadFile { path, offset, length } => {
+                let file_path = temp_dir_clone.join(path);
+                let content = std::fs::read(&file_path).unwrap();
+                let slice = content[offset as usize..(offset as usize + length as usize).min(content.len())].to_vec();
+                framed.send_response(&CommandResponse::FsReadResult { data: slice, error: None }).await.unwrap();
+            }
+            _ => panic!("Expected FsReadFile"),
+        }
+
+        // 3. Stat file
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::FsStat { path } => {
+                let file_path = temp_dir_clone.join(&path);
+                let meta = std::fs::metadata(&file_path).unwrap();
+                let entry = p::protocol::FsEntry {
+                    name: path,
+                    is_dir: meta.is_dir(),
+                    size: meta.len(),
+                    modified_timestamp: 12345678,
+                };
+                framed.send_response(&CommandResponse::FsStatResult { entry: Some(entry), error: None }).await.unwrap();
+            }
+            _ => panic!("Expected FsStat"),
+        }
+
+        // 4. Delete file
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::FsDelete { path } => {
+                let file_path = temp_dir_clone.join(path);
+                let _ = std::fs::remove_file(file_path);
+                framed.send_response(&CommandResponse::FsOpResult { success: true, error: None }).await.unwrap();
+            }
+            _ => panic!("Expected FsDelete"),
+        }
+    });
+
+    let mut controller = NoiseFramedStream::connect_as_initiator(
+        &addr.to_string(),
+        &controller_priv,
+        &agent_pub,
+    ).await.unwrap();
+
+    // 1. Write file
+    let test_data = b"Hello from remote filesystem integration test!".to_vec();
+    controller.send_command(&RemoteCommand::FsWriteFile {
+        path: "test.txt".into(),
+        data: test_data.clone(),
+        truncate: true,
+    }).await.unwrap();
+
+    let res = controller.recv_response().await.unwrap();
+    assert_eq!(res, CommandResponse::FsOpResult { success: true, error: None });
+
+    // 2. Read file back
+    controller.send_command(&RemoteCommand::FsReadFile {
+        path: "test.txt".into(),
+        offset: 0,
+        length: 1024,
+    }).await.unwrap();
+
+    let read_res = controller.recv_response().await.unwrap();
+    match read_res {
+        CommandResponse::FsReadResult { data, error: None } => {
+            assert_eq!(data, test_data);
+        }
+        other => panic!("Expected FsReadResult, got {:?}", other),
+    }
+
+    // 3. Stat file
+    controller.send_command(&RemoteCommand::FsStat {
+        path: "test.txt".into(),
+    }).await.unwrap();
+
+    let stat_res = controller.recv_response().await.unwrap();
+    match stat_res {
+        CommandResponse::FsStatResult { entry: Some(e), .. } => {
+            assert_eq!(e.name, "test.txt");
+            assert_eq!(e.size, test_data.len() as u64);
+            assert!(!e.is_dir);
+        }
+        other => panic!("Expected FsStatResult, got {:?}", other),
+    }
+
+    // 4. Delete file
+    controller.send_command(&RemoteCommand::FsDelete {
+        path: "test.txt".into(),
+    }).await.unwrap();
+
+    let del_res = controller.recv_response().await.unwrap();
+    assert_eq!(del_res, CommandResponse::FsOpResult { success: true, error: None });
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    agent_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_webdav_server_http_methods() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let agent_keypair = generate_keypair().unwrap();
+    let controller_keypair = generate_keypair().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let agent_priv = agent_keypair.private.clone();
+    let agent_pub = agent_keypair.public.clone();
+    let controller_priv = controller_keypair.private.clone();
+
+    let agent_pub_for_acceptor = agent_pub.clone();
+    let agent_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = NoiseFramedStream::accept_as_responder(stream, &agent_priv, &agent_pub_for_acceptor).await.unwrap();
+
+        // 1. Responds to PROPFIND's FsStat
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::FsStat { path: _ } => {
+                let entry = p::protocol::FsEntry {
+                    name: "hello.txt".into(),
+                    is_dir: false,
+                    size: 13,
+                    modified_timestamp: 1773000000,
+                };
+                framed.send_response(&CommandResponse::FsStatResult { entry: Some(entry), error: None }).await.unwrap();
+            }
+            _ => panic!("Expected FsStat"),
+        }
+
+        // 2. Responds to GET's FsStat and FsReadFile
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::FsStat { path: _ } => {
+                let entry = p::protocol::FsEntry {
+                    name: "hello.txt".into(),
+                    is_dir: false,
+                    size: 13,
+                    modified_timestamp: 1773000000,
+                };
+                framed.send_response(&CommandResponse::FsStatResult { entry: Some(entry), error: None }).await.unwrap();
+            }
+            _ => panic!("Expected FsStat"),
+        }
+
+        let cmd = framed.recv_command().await.unwrap();
+        match cmd {
+            RemoteCommand::FsReadFile { path: _, offset: _, length: _ } => {
+                framed.send_response(&CommandResponse::FsReadResult {
+                    data: b"Hello, WebDAV".to_vec(),
+                    error: None,
+                }).await.unwrap();
+            }
+            _ => panic!("Expected FsReadFile"),
+        }
+    });
+
+    let controller = NoiseFramedStream::connect_as_initiator(
+        &addr.to_string(),
+        &controller_priv,
+        &agent_pub,
+    ).await.unwrap();
+
+    let controller_arc = Arc::new(Mutex::new(controller));
+    let (_webdav, webdav_port) = p::webdav::WebDavServer::start(controller_arc.clone(), 0).await.unwrap();
+
+    // 1. Test OPTIONS HTTP
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", webdav_port)).await.unwrap();
+    client.write_all(b"OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
+    let mut resp = vec![0u8; 1024];
+    let n = client.read(&mut resp).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp[..n]);
+    assert!(resp_str.contains("200 OK"));
+    assert!(resp_str.contains("DAV: 1, 2"));
+
+    // 2. Test PROPFIND HTTP
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", webdav_port)).await.unwrap();
+    client2.write_all(b"PROPFIND /hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nDepth: 0\r\n\r\n").await.unwrap();
+    let mut resp2 = vec![0u8; 2048];
+    let n2 = client2.read(&mut resp2).await.unwrap();
+    let resp_str2 = String::from_utf8_lossy(&resp2[..n2]);
+    assert!(resp_str2.contains("207 Multi-Status"));
+    assert!(resp_str2.contains("hello.txt"));
+
+    // 3. Test GET HTTP
+    let mut client3 = TcpStream::connect(format!("127.0.0.1:{}", webdav_port)).await.unwrap();
+    client3.write_all(b"GET /hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
+    let mut resp3 = Vec::new();
+    client3.read_to_end(&mut resp3).await.unwrap();
+    let resp_str3 = String::from_utf8_lossy(&resp3);
+    assert!(resp_str3.contains("200 OK"));
+    assert!(resp_str3.contains("Hello, WebDAV"));
+
+    agent_handle.await.unwrap();
+}
+
 

@@ -70,6 +70,17 @@ pub enum ControllerCommand {
         local_path: PathBuf,
     },
 
+    /// Mount filesystem remote Agent sebagai drive lokal (WebDAV virtual drive, default P:)
+    Mount {
+        /// Huruf drive lokal di Windows (contoh: P: atau F:), default: P:
+        #[arg(default_value = "P:")]
+        drive: String,
+
+        /// Port lokal untuk server WebDAV bridge (0 = acak/otomatis)
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+
     /// Rotasi kunci sesi secara manual
     Rekey,
 
@@ -247,7 +258,7 @@ async fn perform_download(
     Ok(())
 }
 
-async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Result<()> {
+async fn run_interactive_shell(stream: Arc<Mutex<NoiseFramedStream>>, addr: &str) -> Result<()> {
     use std::io::{self, Write};
 
     println!("══════════════════════════════════════════════════════════");
@@ -258,6 +269,9 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
     println!("══════════════════════════════════════════════════════════");
 
     let stdin = io::stdin();
+    #[allow(unused_mut)]
+    let mut mounted_drive: Option<String> = None;
+
     loop {
         print!("p[{}]> ", addr);
         let _ = io::stdout().flush();
@@ -280,6 +294,10 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
         }
 
         if trimmed == "exit" || trimmed == "quit" {
+            #[cfg(target_os = "windows")]
+            if let Some(ref d) = mounted_drive {
+                let _ = crate::webdav::unmount_windows_drive(d);
+            }
             println!("👋 Sesi remote shell ditutup.");
             break;
         }
@@ -289,6 +307,8 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
             println!("   stats                      - Cek beban CPU & RAM di Agent");
             println!("   upload <local_file>        - Unggah file lokal ke Agent");
             println!("   download <remote> [local]  - Unduh file dari Agent ke lokal");
+            println!("   mount [drive]              - Mount remote files ke drive lokal (default P:)");
+            println!("   unmount                    - Lepas mount drive lokal");
             println!("   rekey                      - Rotasi kunci sesi enkripsi Noise");
             println!("   clear / cls                - Bersihkan layar");
             println!("   exit / quit                - Keluar dari remote shell");
@@ -303,8 +323,9 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
         }
 
         if trimmed == "stats" {
-            stream.send_command(&RemoteCommand::GetSystemStats).await?;
-            if let Ok(resp) = stream.recv_response().await {
+            let mut guard = stream.lock().await;
+            guard.send_command(&RemoteCommand::GetSystemStats).await?;
+            if let Ok(resp) = guard.recv_response().await {
                 match resp {
                     CommandResponse::SystemStats { cpu_usage, ram_used_mb } => {
                         println!("📊 CPU: {:.2}% | RAM: {} MB", cpu_usage, ram_used_mb);
@@ -317,9 +338,10 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
 
         if trimmed == "rekey" {
             println!("🔄 Memutar kunci sesi simetris...");
-            stream.send_command(&RemoteCommand::RequestKeyRotation).await?;
-            let _ = stream.rekey();
-            if let Ok(resp) = stream.recv_response().await {
+            let mut guard = stream.lock().await;
+            guard.send_command(&RemoteCommand::RequestKeyRotation).await?;
+            let _ = guard.rekey();
+            if let Ok(resp) = guard.recv_response().await {
                 match resp {
                     CommandResponse::KeyRotationReady => {
                         println!("✅ Rotasi kunci sesi berhasil!");
@@ -334,8 +356,11 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
             let path_arg = trimmed[7..].trim();
             if path_arg.is_empty() {
                 println!("⚠️ Format: upload <path_file_lokal>");
-            } else if let Err(e) = perform_upload(stream, PathBuf::from(path_arg)).await {
-                eprintln!("❌ Upload gagal: {}", e);
+            } else {
+                let mut guard = stream.lock().await;
+                if let Err(e) = perform_upload(&mut *guard, PathBuf::from(path_arg)).await {
+                    eprintln!("❌ Upload gagal: {}", e);
+                }
             }
             continue;
         }
@@ -353,15 +378,79 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
                 let default_name = std::path::Path::new(&remote).file_name().unwrap_or_default();
                 PathBuf::from(default_name)
             };
-            if let Err(e) = perform_download(stream, remote, local).await {
+            let mut guard = stream.lock().await;
+            if let Err(e) = perform_download(&mut *guard, remote, local).await {
                 eprintln!("❌ Download gagal: {}", e);
             }
             continue;
         }
 
+        if trimmed == "mount" || trimmed.starts_with("mount ") {
+            let arg = if trimmed == "mount" { "P:" } else { trimmed[6..].trim() };
+            let drive_clean = arg.to_uppercase();
+            let drive_letter = if drive_clean.ends_with(':') {
+                drive_clean
+            } else {
+                format!("{}:", drive_clean)
+            };
+
+            if mounted_drive.is_some() {
+                println!("⚠️ Sudah ada drive yang di-mount: {}. Jalankan 'unmount' terlebih dahulu.", mounted_drive.as_ref().unwrap());
+                continue;
+            }
+
+            println!("⏳ Memulai WebDAV virtual server...");
+            match crate::webdav::WebDavServer::start(stream.clone(), 0).await {
+                Ok((_server, actual_port)) => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        println!("🔌 Menghubungkan drive {} ke File Explorer...", drive_letter);
+                        match crate::webdav::mount_windows_drive(&drive_letter, actual_port) {
+                            Ok(()) => {
+                                println!("✅ Berhasil! Remote files kini terbuka di Drive {}.", drive_letter);
+                                println!("📂 Anda bisa membuka 'This PC' -> '{}' di File Explorer.", drive_letter);
+                                mounted_drive = Some(drive_letter);
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ Gagal mount drive {}: {}", drive_letter, e);
+                                eprintln!("💡 URL WebDAV: http://127.0.0.1:{}/", actual_port);
+                            }
+                        }
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        println!("✅ WebDAV aktif di http://127.0.0.1:{}/", actual_port);
+                        mounted_drive = Some(drive_letter);
+                    }
+                }
+                Err(e) => eprintln!("❌ Gagal memulai server WebDAV: {}", e),
+            }
+            continue;
+        }
+
+        if trimmed == "unmount" {
+            if let Some(ref d) = mounted_drive {
+                #[cfg(target_os = "windows")]
+                {
+                    println!("🔌 Melepas drive {}...", d);
+                    let _ = crate::webdav::unmount_windows_drive(d);
+                    println!("✅ Drive {} telah dilepas.", d);
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    println!("✅ Drive telah dilepas.");
+                }
+                mounted_drive = None;
+            } else {
+                println!("ℹ️ Tidak ada drive yang sedang di-mount.");
+            }
+            continue;
+        }
+
         // Jalankan perintah terminal biasa di Agent
-        stream.send_command(&RemoteCommand::RunTerminal(trimmed.to_string())).await?;
-        match stream.recv_response().await {
+        let mut guard = stream.lock().await;
+        guard.send_command(&RemoteCommand::RunTerminal(trimmed.to_string())).await?;
+        match guard.recv_response().await {
             Ok(CommandResponse::TerminalOutput { stdout, stderr }) => {
                 if !stdout.is_empty() {
                     print!("{}", stdout);
@@ -381,6 +470,11 @@ async fn run_interactive_shell(stream: &mut NoiseFramedStream, addr: &str) -> Re
                 break;
             }
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(ref d) = mounted_drive {
+        let _ = crate::webdav::unmount_windows_drive(d);
     }
 
     Ok(())
@@ -522,7 +616,8 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
     let cmd = args.command.unwrap_or(ControllerCommand::Shell);
     match cmd {
         ControllerCommand::Shell => {
-            run_interactive_shell(&mut stream, &target_addr).await?;
+            let stream_arc = Arc::new(Mutex::new(stream));
+            run_interactive_shell(stream_arc, &target_addr).await?;
         }
 
         ControllerCommand::Exec { command } => {
@@ -565,6 +660,51 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
 
         ControllerCommand::Download { remote_path, local_path } => {
             perform_download(&mut stream, remote_path, local_path).await?;
+        }
+
+        ControllerCommand::Mount { drive, port } => {
+            let stream_arc = Arc::new(Mutex::new(stream));
+            let (_server, actual_port) = crate::webdav::WebDavServer::start(stream_arc.clone(), port).await?;
+            println!("🌐 WebDAV Virtual Drive Server aktif di http://127.0.0.1:{}/", actual_port);
+
+            let drive_clean = drive.trim().to_uppercase();
+            let drive_letter = if drive_clean.ends_with(':') {
+                drive_clean
+            } else {
+                format!("{}:", drive_clean)
+            };
+
+            #[cfg(target_os = "windows")]
+            {
+                println!("🔌 Memasang drive {} di Windows File Explorer via 'net use'...", drive_letter);
+                match crate::webdav::mount_windows_drive(&drive_letter, actual_port) {
+                    Ok(()) => {
+                        println!("✅ Drive {} berhasil di-mount!", drive_letter);
+                        println!("📂 Buka Windows Explorer -> This PC -> Drive {} untuk menjelajah remote file.", drive_letter);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Gagal me-mount otomatis via net use: {}", e);
+                        eprintln!("💡 Anda dapat me-mount manual di Command Prompt:");
+                        eprintln!("   net use {} http://127.0.0.1:{}/ /persistent:no", drive_letter, actual_port);
+                    }
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                println!("💡 Di Linux/macOS, pasang WebDAV menggunakan file manager Anda atau davfs2:");
+                println!("   mount -t davfs http://127.0.0.1:{}/ /mnt/agent", actual_port);
+            }
+
+            println!("🛑 Tekan Ctrl+C untuk melepas mount (unmount) dan keluar.");
+            let _ = tokio::signal::ctrl_c().await;
+
+            #[cfg(target_os = "windows")]
+            {
+                println!("\n🔌 Melepas drive {}...", drive_letter);
+                let _ = crate::webdav::unmount_windows_drive(&drive_letter);
+                println!("👋 Drive {} dilepas. Selesai.", drive_letter);
+            }
         }
 
         ControllerCommand::Rekey => {

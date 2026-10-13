@@ -23,9 +23,26 @@ pub enum RemoteCommand {
     // Autentikasi / Pairing
     Authenticate { token: String },
 
+    // Remote Virtual Drive / Filesystem Operations
+    FsListDir { path: String },
+    FsStat { path: String },
+    FsReadFile { path: String, offset: u64, length: u32 },
+    FsWriteFile { path: String, data: Vec<u8>, truncate: bool },
+    FsDelete { path: String },
+    FsMkdir { path: String },
+    FsRename { from: String, to: String },
+
     // Remote Port Forwarding (-R: Agent Listener -> Controller Target)
     StartRemoteForward { bind_port: u16, target_controller_port: u16 },
     StopRemoteForward { bind_port: u16 },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct FsEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified_timestamp: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -34,6 +51,12 @@ pub enum CommandResponse {
     AuthChallenge,
     AuthSuccess,
     AuthFailed(String),
+
+    // Respons Remote Virtual Drive
+    FsListResult { entries: Vec<FsEntry>, error: Option<String> },
+    FsStatResult { entry: Option<FsEntry>, error: Option<String> },
+    FsReadResult { data: Vec<u8>, error: Option<String> },
+    FsOpResult { success: bool, error: Option<String> },
 
     TerminalOutput { stdout: String, stderr: String },
     SystemStats { cpu_usage: f32, ram_used_mb: u64 },

@@ -251,7 +251,14 @@ p[1.2.3.4:9999]> stats
 📊 CPU: 1.20% | RAM: 320 MB
 p[1.2.3.4:9999]> download /etc/hosts ./hosts.txt
 📥 Mengunduh file 'hosts' (250 byte, 1 chunks)...
-✅ File berhasil diunduh ke: ./hosts.txt
+p[1.2.3.4:9999]> mount P:
+⏳ Memulai WebDAV virtual server...
+🔌 Menghubungkan drive P: ke File Explorer...
+✅ Berhasil! Remote files kini terbuka di Drive P:.
+📂 Anda bisa membuka 'This PC' -> 'P:' di File Explorer.
+p[1.2.3.4:9999]> unmount
+🔌 Melepas drive P:...
+✅ Drive P: telah dilepas.
 p[1.2.3.4:9999]> exit
 👋 Sesi remote shell ditutup.
 ```
@@ -260,6 +267,9 @@ p[1.2.3.4:9999]> exit
 
 #### Menjalankan Perintah Sekali Jalan (Non-Interactive / Scripting):
 ```bash
+# Mount File Explorer Windows Drive (P:)
+./target/release/p controller 1.2.3.4:9999 mount P:
+
 # Cek Statistik
 ./target/release/p controller 1.2.3.4:9999 stats
 
@@ -283,8 +293,15 @@ p[1.2.3.4:9999]> exit
 
 ---
 
+6. **Native Virtual Drive Mounting (WebDAV Explorer Bridge)**
+   * Memasang direktori remote Agent langsung sebagai drive letter (seperti `P:` atau `F:`) di **Windows File Explorer** atau mount point di Linux/macOS.
+   * Mengizinkan drag-and-drop upload, download, membuka, mengedit, dan menghapus file remote seolah-olah drive lokal tanpa instalasi driver pihak ketiga (menggunakan layanan native bawaan `WebClient` Windows).
+
+---
+
 ## 🏗️ Status Implementasi (Completed ✅)
 
+- [x] **Virtual Drive Mounting (Windows Explorer / WebDAV):** Mount remote filesystem langsung ke drive letter Windows (misal `P:`) via `p controller <IP:PORT> mount P:` atau perintah `mount` di dalam interactive shell prompt!
 - [x] **Single Binary Architecture (`p`):** Menggabungkan peran Agent, Controller, dan Keygen ke dalam satu biner tunggal hemat memori dan ukuran (~1.3 MB).
 - [x] **SSH-Style Interactive REPL Shell:** Cukup ketik `p controller <IP:PORT>` untuk langsung masuk ke sesi shell prompt `p[IP:PORT]>` tanpa harus berulang kali mengetik perintah CLI.
 - [x] **Pairing Token & `authorized_controllers`:** Autentikasi password aman pada koneksi pertama dan penyimpanan whitelist otomatis sehingga login berikutnya berlangsung instan.

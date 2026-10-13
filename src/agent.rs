@@ -198,6 +198,15 @@ async fn run_reconnect_loop(
     }
 }
 
+fn resolve_safe_path(base_dir: &Path, rel_path: &str) -> PathBuf {
+    let clean = rel_path.trim_start_matches('/').trim_start_matches('\\');
+    if clean.is_empty() {
+        base_dir.to_path_buf()
+    } else {
+        base_dir.join(clean)
+    }
+}
+
 async fn handle_session(
     mut stream: NoiseFramedStream,
     storage_dir: PathBuf,
@@ -282,6 +291,161 @@ async fn handle_session(
                 match cmd {
                     RemoteCommand::Authenticate { .. } => {
                         stream.send_response(&CommandResponse::AuthSuccess).await?;
+                    }
+
+                    RemoteCommand::FsListDir { path } => {
+                        let target = resolve_safe_path(&storage_dir, &path);
+                        match std::fs::read_dir(&target) {
+                            Ok(read_dir) => {
+                                let mut entries = Vec::new();
+                                for entry in read_dir.flatten() {
+                                    let filename = entry.file_name().to_string_lossy().to_string();
+                                    if let Ok(meta) = entry.metadata() {
+                                        let is_dir = meta.is_dir();
+                                        let size = if is_dir { 0 } else { meta.len() };
+                                        let modified = meta
+                                            .modified()
+                                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        entries.push(crate::protocol::FsEntry {
+                                            name: filename,
+                                            is_dir,
+                                            size,
+                                            modified_timestamp: modified,
+                                        });
+                                    }
+                                }
+                                stream.send_response(&CommandResponse::FsListResult { entries, error: None }).await?;
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::FsListResult {
+                                    entries: Vec::new(),
+                                    error: Some(e.to_string()),
+                                }).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::FsStat { path } => {
+                        let target = resolve_safe_path(&storage_dir, &path);
+                        match std::fs::metadata(&target) {
+                            Ok(meta) => {
+                                let is_dir = meta.is_dir();
+                                let size = if is_dir { 0 } else { meta.len() };
+                                let modified = meta
+                                    .modified()
+                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".into());
+                                let entry = crate::protocol::FsEntry {
+                                    name,
+                                    is_dir,
+                                    size,
+                                    modified_timestamp: modified,
+                                };
+                                stream.send_response(&CommandResponse::FsStatResult { entry: Some(entry), error: None }).await?;
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::FsStatResult {
+                                    entry: None,
+                                    error: Some(e.to_string()),
+                                }).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::FsReadFile { path, offset, length } => {
+                        let target = resolve_safe_path(&storage_dir, &path);
+                        let read_res = (|| -> std::io::Result<Vec<u8>> {
+                            use std::io::{Read, Seek, SeekFrom};
+                            let mut file = std::fs::File::open(&target)?;
+                            file.seek(SeekFrom::Start(offset))?;
+                            let mut buf = vec![0u8; length.min(65536) as usize];
+                            let n = file.read(&mut buf)?;
+                            buf.truncate(n);
+                            Ok(buf)
+                        })();
+                        match read_res {
+                            Ok(data) => {
+                                stream.send_response(&CommandResponse::FsReadResult { data, error: None }).await?;
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::FsReadResult { data: Vec::new(), error: Some(e.to_string()) }).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::FsWriteFile { path, data, truncate } => {
+                        let target = resolve_safe_path(&storage_dir, &path);
+                        if let Some(parent) = target.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let write_res = (|| -> std::io::Result<()> {
+                            use std::io::Write;
+                            let mut file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .truncate(truncate)
+                                .append(!truncate)
+                                .open(&target)?;
+                            file.write_all(&data)?;
+                            file.flush()?;
+                            Ok(())
+                        })();
+                        match write_res {
+                            Ok(()) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: true, error: None }).await?;
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: false, error: Some(e.to_string()) }).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::FsDelete { path } => {
+                        let target = resolve_safe_path(&storage_dir, &path);
+                        let del_res = if target.is_dir() {
+                            std::fs::remove_dir_all(&target)
+                        } else {
+                            std::fs::remove_file(&target)
+                        };
+                        match del_res {
+                            Ok(()) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: true, error: None }).await?;
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: false, error: Some(e.to_string()) }).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::FsMkdir { path } => {
+                        let target = resolve_safe_path(&storage_dir, &path);
+                        match std::fs::create_dir_all(&target) {
+                            Ok(()) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: true, error: None }).await?;
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: false, error: Some(e.to_string()) }).await?;
+                            }
+                        }
+                    }
+
+                    RemoteCommand::FsRename { from, to } => {
+                        let target_from = resolve_safe_path(&storage_dir, &from);
+                        let target_to = resolve_safe_path(&storage_dir, &to);
+                        match std::fs::rename(&target_from, &target_to) {
+                            Ok(()) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: true, error: None }).await?;
+                            }
+                            Err(e) => {
+                                stream.send_response(&CommandResponse::FsOpResult { success: false, error: Some(e.to_string()) }).await?;
+                            }
+                        }
                     }
 
                     RemoteCommand::RunTerminal(command_str) => {
