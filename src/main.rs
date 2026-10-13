@@ -11,7 +11,7 @@ use p::crypto::generate_keypair;
     name = "p",
     author,
     version,
-    about = "Custom Lightweight Multiplatform Remote Control Agent & Controller"
+    about = "Lightweight Multiplatform Remote Control Agent & Controller"
 )]
 struct Cli {
     /// Alamat target remote (contoh: 1.2.3.4:9999).
@@ -44,11 +44,19 @@ struct Cli {
     #[arg(long, default_value = "./storage")]
     pub storage_dir: PathBuf,
 
-    /// Mode Reverse Connection:
-    /// - Pada target/agent: `p 1.2.3.4:9999 -R` (agent menghubung balik ke controller)
-    /// - Pada controller: `p -R` atau `p -R -p 9999` (controller mendengarkan koneksi masuk dari agent)
-    #[arg(short = 'R', long = "reverse")]
+    /// Mode Reverse Connection (NAT/Firewall Traversal):
+    /// - Pada target/agent: `p 1.2.3.4:9999 -r` (agent menghubung balik ke controller)
+    /// - Pada controller: `p -r` atau `p -r -p 9999` (controller mendengarkan koneksi masuk dari agent)
+    #[arg(short = 'r', long = "reverse")]
     pub reverse: bool,
+
+    /// Local Port Forwarding (seperti ssh -L local_port:remote_port), contoh: -L 8080:80
+    #[arg(short = 'L', long = "forward-local", value_name = "LOCAL:REMOTE")]
+    pub forward_local: Option<String>,
+
+    /// Remote Port Forwarding (seperti ssh -R agent_port:controller_port), contoh: -R 9090:8080
+    #[arg(short = 'R', long = "forward-remote", value_name = "REMOTE:LOCAL")]
+    pub forward_remote: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<ControllerCommand>,
@@ -70,15 +78,24 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Resolusi command port forwarding dari flag -L / -R
+    let command = if let Some(mapping) = cli.forward_local {
+        Some(ControllerCommand::ForwardLocal { mapping })
+    } else if let Some(mapping) = cli.forward_remote {
+        Some(ControllerCommand::ForwardRemote { mapping })
+    } else {
+        cli.command
+    };
+
     // 2. Tentukan peran: Controller vs Agent
-    // - Jika flag -R aktif dan ada target -> Agent connecting reverse to Controller
-    // - Jika flag -R aktif tanpa target -> Controller listening for reverse Agent
+    // - Jika flag -r aktif dan ada target -> Agent connecting reverse to Controller
+    // - Jika flag -r aktif tanpa target -> Controller listening for reverse Agent
     // - Jika normal dan ada target / command -> Controller connecting to Agent
     // - Jika normal tanpa target -> Agent listening
     let is_controller = if cli.reverse {
         cli.target.is_none() // Jika tanpa target, Controller yang listen
     } else {
-        cli.target.is_some() || cli.command.is_some()
+        cli.target.is_some() || command.is_some()
     };
 
     if is_controller {
@@ -90,7 +107,7 @@ async fn main() -> Result<()> {
             privkey: cli.privkey,
             agent_pubkey: cli.agent_pubkey,
             reverse: cli.reverse,
-            command: cli.command,
+            command,
         };
         run_controller(args).await
     } else {
