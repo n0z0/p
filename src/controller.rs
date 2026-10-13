@@ -100,6 +100,9 @@ pub enum ControllerCommand {
 
     /// Kirim perintah shutdown ke Agent
     Shutdown,
+
+    /// Buat pasangan kunci kriptografi Noise 25519 baru
+    Keygen,
 }
 
 const CHUNK_SIZE: usize = 32 * 1024; // 32 KB per chunk
@@ -937,6 +940,14 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
                 CommandResponse::TerminalOutput { stdout, .. } => println!("{}", stdout),
                 other => println!("Respons: {:?}", other),
             }
+        }
+
+        ControllerCommand::Keygen => {
+            let keypair = crate::crypto::generate_keypair()?;
+            println!("🔑 PASANGAN KUNCI BARU (25519):");
+            println!("   Public Key : {}", hex::encode(&keypair.public));
+            println!("   Private Key: {}", hex::encode(&keypair.private));
+            println!("\n💡 Gunakan Public Key pada Controller (-k) dan Private Key pada Agent (--privkey).");
         }
     }
 

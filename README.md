@@ -208,10 +208,15 @@ Biner tunggal akan dihasilkan di `target/release/p` (atau `target/release/p.exe`
 ```
 Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex).
 
-### 3. Menjalankan Mode Agent (di Server / VPS / IoT)
+### 3. Menjalankan di Target / Server (Otomatis Mode Agent)
+Cukup jalankan `p` tanpa argumen! Aplikasi otomatis berjalan sebagai daemon/server yang siap melayani instruksi di port default `9999`:
+
 ```bash
 # Otomatis: host key dibuat persisten di ~/.p/agent.key, pairing token di ~/.p/agent.token
-./target/release/p agent --addr 0.0.0.0:9999
+./target/release/p
+
+# Atau tentukan port kustom jika diinginkan:
+./target/release/p -p 8080
 
 # Output saat Agent berjalan:
 # 🔑 Kunci Host Agent Persisten (~/.p/agent.key)
@@ -222,11 +227,11 @@ Perintah ini mencetak *Public Key* (32-byte hex) dan *Private Key* (32-byte hex)
 ```
 
 ### 4. Menghubungkan Controller (SSH-Style Interactive REPL Shell)
-Cukup tentukan alamat target, dan Controller akan meminta password (hanya saat pairing pertama kali), lalu langsung membuka prompt remote shell interaktif:
+Cukup tentukan alamat target (misal `1.2.3.4:9999`), dan `p` otomatis bertindak sebagai **Controller**:
 
 ```bash
-# Masuk ke Interactive Shell (seperti SSH)
-./target/release/p controller 1.2.3.4:9999
+# Masuk ke Interactive Shell (seperti SSH):
+./target/release/p 1.2.3.4:9999
 ```
 
 Tampilan interaktif:
@@ -238,7 +243,7 @@ Tampilan interaktif:
 ✅ Pairing berhasil! Kunci Controller telah diotorisasi di Agent (~/.p/authorized_controllers).
 
 ══════════════════════════════════════════════════════════
-💻 SESI INTERAKTIF REMOTE SHELL (p controller)
+💻 SESI INTERAKTIF REMOTE SHELL (p)
    Target Host : 1.2.3.4:9999
    Bantuan     : Ketik 'help' untuk daftar perintah khusus
    Keluar      : Ketik 'exit' atau tekan Ctrl+C
@@ -263,32 +268,32 @@ p[1.2.3.4:9999]> exit
 👋 Sesi remote shell ditutup.
 ```
 
-> **Zero-Friction:** Pada koneksi berikutnya, Controller langsung terhubung tanpa perlu memasukkan password lagi karena kunci Controller telah masuk di whitelist `~/.p/authorized_controllers` Agent!
+> **Zero-Friction:** Pada koneksi berikutnya, Anda langsung terhubung tanpa perlu memasukkan password lagi karena kunci Controller telah masuk di whitelist `~/.p/authorized_controllers` Agent!
 
 #### Menjalankan Perintah Sekali Jalan (Non-Interactive / Scripting):
 ```bash
 # Mount File Explorer Windows Drive (P:)
-./target/release/p controller 1.2.3.4:9999 mount P:
+./target/release/p 1.2.3.4:9999 mount P:
 
 # Cek Statistik
-./target/release/p controller 1.2.3.4:9999 stats
+./target/release/p 1.2.3.4:9999 stats
 
 # Eksekusi Terminal
-./target/release/p controller 1.2.3.4:9999 exec "systemctl status nginx"
+./target/release/p 1.2.3.4:9999 exec "systemctl status nginx"
 
 # Upload & Download File
-./target/release/p controller 1.2.3.4:9999 upload ./file.zip
-./target/release/p controller 1.2.3.4:9999 download /var/log/syslog ./syslog.log
+./target/release/p 1.2.3.4:9999 upload ./file.zip
+./target/release/p 1.2.3.4:9999 download /var/log/syslog ./syslog.log
 
 # Rotasi Kunci Sesi
-./target/release/p controller 1.2.3.4:9999 rekey
+./target/release/p 1.2.3.4:9999 rekey
 
 # Port Forwarding
-./target/release/p controller 1.2.3.4:9999 forward-local -L 8080:80
-./target/release/p controller 1.2.3.4:9999 forward-remote -R 9090:8080
+./target/release/p 1.2.3.4:9999 forward-local -L 8080:80
+./target/release/p 1.2.3.4:9999 forward-remote -R 9090:8080
 
 # Matikan Perangkat
-./target/release/p controller 1.2.3.4:9999 shutdown
+./target/release/p 1.2.3.4:9999 shutdown
 ```
 
 ---
