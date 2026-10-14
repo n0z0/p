@@ -163,6 +163,26 @@ p keygen
 
 ---
 
+### 7. Log Audit & Telemetri SOC / CTI
+
+Server secara otomatis mencatat seluruh aktivitas client ke dalam file audit bervalidasi format **NDJSON (Newline-Delimited JSON)** di `~/.p/audit.log` yang kompatibel dengan SIEM (Splunk, Elastic/Wazuh, Sentinel):
+
+* **Event yang dicatat**: Autentikasi (sukses/gagal), eksekusi perintah terminal mentah (`COMMAND_EXEC`), upload file, download file, akses file WebDAV, pembukaan port forwarding (`-L` dan `-R`), rotasi kunci, serta sinyal shutdown.
+* **Metadata CTI Lengkap**: Timestamp ISO 8601 UTC dengan milidetik, fingerprint kunci publik client (SHA256), nickname/label client, IP & port remote client, IP & port lokal server, serta ID sesi unik.
+
+```bash
+# Menjalankan server dengan lokasi audit log kustom:
+p --audit-log /var/log/p-audit.ndjson
+
+# Menjalankan server tanpa audit log:
+p --no-audit
+
+# Memantau aktivitas client secara real-time:
+tail -f ~/.p/audit.log
+```
+
+---
+
 ## 🛠️ Informasi Teknis & Developer
 
 Untuk dokumentasi arsitektur internal, spesifikasi protokol biner, multiplexing channel, dan panduan kompilasi dari source code, silakan baca **[DEV.md](DEV.md)**.

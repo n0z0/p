@@ -128,7 +128,7 @@ pub enum RemoteCommand {
     CloseForwardChannel { channel_id: u32 },
 
     // Remote Port Forwarding
-    StartRemoteForward { bind_port: u16, target_controller_port: u16 },
+    StartRemoteForward { bind_port: u16, target_client_port: u16 },
 
     // WebDAV Virtual Drive Filesystem Operations
     FsReadDir { path: String },
@@ -160,6 +160,27 @@ pub enum CommandResponse {
     ExecutionError(String),
 }
 ```
+
+---
+
+## 🛡️ Telemetri & Audit Log CTI (SOC-Grade)
+
+Server mengimplementasikan modul telemetri keamanan mandiri (`src/audit.rs`) dengan arsitektur **Zero-Bloat** (tanpa dependensi eksternal berat) yang menghasilkan log streaming berstandar **NDJSON (Newline-Delimited JSON)** ke `~/.p/audit.log`. Format ini kompatibel langsung untuk ingest SIEM (Wazuh, Splunk, Elastic Security, Microsoft Sentinel).
+
+### Contoh Entri Log Mentah:
+```json
+{"timestamp":"2026-10-14T04:45:00.123Z","event_type":"COMMAND_EXEC","severity":"NOTICE","session_id":"sess-a1b2c3d4e5f67890","client":{"fingerprint":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","nickname":"laptop-joe","remote_ip":"203.0.113.45:51234"},"server":{"local_addr":"0.0.0.0:9999"},"action":{"command":"cat /etc/passwd"}}
+```
+
+### Taksonomi Event Audit:
+* **`AUTH_ATTEMPT` / `AUTH_SUCCESS` / `AUTH_FAILED`**: Pelacakan autentikasi kunci publik atau token pairing.
+* **`COMMAND_EXEC`**: Pencatatan string perintah terminal mentah untuk deteksi ancaman (MITRE ATT&CK).
+* **`FILE_UPLOAD` / `FILE_DOWNLOAD`**: Pelacakan pemindahan file (chunk-based) untuk forensik exfiltrasi data atau dropping file berbahaya.
+* **`WEBDAV_FS_ACCESS`**: Pelacakan operasi virtual drive filesystem (LIST, STAT, READ, WRITE, DELETE, MKDIR, RENAME).
+* **`PORT_FORWARD` / `PORT_FORWARD_REMOTE`**: Pelacakan tunnel port forwarding (`-L` dan `-R`) untuk mendeteksi *lateral movement* / *network pivoting*.
+* **`SESSION_REKEY`**: Audit rotasi kunci enkripsi simetris pada sesi aktif.
+* **`DEVICE_SHUTDOWN`**: Pemicuan sinyal shutdown mesin server.
+* **`SESSION_CLOSE`**: Penutupan sesi koneksi client.
 
 ---
 

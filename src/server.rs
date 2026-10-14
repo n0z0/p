@@ -10,8 +10,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
+use crate::audit::{AuditLogger, AuditSessionContext};
 use crate::crypto::{
-    add_authorized_client, compute_key_fingerprint, is_client_authorized,
+    add_authorized_client, compute_key_fingerprint, lookup_authorized_client,
     load_or_create_server_key, load_or_create_server_token,
 };
 use crate::framed::NoiseFramedStream;
@@ -47,6 +48,14 @@ pub struct ServerArgs {
     /// Batas volume data rotasi kunci otomatis dalam byte (default: 1 GB)
     #[arg(long, default_value_t = 1_073_741_824)]
     pub key_rotation_bytes: u64,
+
+    /// Path kustom ke file log audit telemetri CTI mentah (default: ~/.p/audit.log)
+    #[arg(long)]
+    pub audit_log: Option<PathBuf>,
+
+    /// Nonaktifkan pencatatan audit log telemetri CTI
+    #[arg(long)]
+    pub no_audit: bool,
 }
 
 struct FileTransferState {
@@ -89,15 +98,28 @@ pub async fn run_server(args: ServerArgs) -> Result<()> {
     println!("   Token       : {}", pairing_token);
     println!("   Petunjuk    : Masukkan token ini ketika Client pertama kali menghubung!");
     println!("   Keamanan    : Client yang berhasil pairing dicatat di ~/.p/authorized_clients");
+
+    let audit_path = if args.no_audit {
+        None
+    } else {
+        Some(args.audit_log.clone().unwrap_or_else(AuditLogger::default_log_path))
+    };
+    if let Some(ref p) = audit_path {
+        println!("   Audit Log   : Telemetri CTI aktif di {}", p.display());
+    } else {
+        println!("   Audit Log   : Dinonaktifkan (--no-audit)");
+    }
     println!();
+
     let pairing_token = Arc::new(pairing_token);
+    let audit_logger = Arc::new(AuditLogger::new(audit_path));
 
     match args.mode.to_lowercase().as_str() {
         "listen" => {
-            run_listen_loop(&args, &privkey_bytes, &pubkey_bytes, pairing_token).await?;
+            run_listen_loop(&args, &privkey_bytes, &pubkey_bytes, pairing_token, audit_logger).await?;
         }
         "connect" => {
-            run_reconnect_loop(&args, &privkey_bytes, &pubkey_bytes, pairing_token).await?;
+            run_reconnect_loop(&args, &privkey_bytes, &pubkey_bytes, pairing_token, audit_logger).await?;
         }
         other => {
             bail!("Mode tidak dikenal '{}'. Gunakan 'listen' atau 'connect'.", other);
@@ -112,6 +134,7 @@ async fn run_listen_loop(
     privkey: &[u8],
     pubkey: &[u8],
     pairing_token: Arc<String>,
+    audit_logger: Arc<AuditLogger>,
 ) -> Result<()> {
     let listener = TcpListener::bind(&args.addr)
         .await
@@ -129,13 +152,25 @@ async fn run_listen_loop(
                 let rot_secs = args.key_rotation_secs;
                 let rot_bytes = args.key_rotation_bytes;
                 let token_clone = pairing_token.clone();
+                let peer_addr_str = peer_addr.to_string();
+                let local_addr_str = args.addr.clone();
+                let audit_clone = audit_logger.clone();
 
                 tokio::spawn(async move {
                     match NoiseFramedStream::accept_as_responder(stream, &privkey_clone, &pubkey_clone).await {
                         Ok(framed) => {
                             info!("🔒 Handshake Noise IK sukses dengan {}", peer_addr);
-                            if let Err(e) = handle_session(framed, storage_dir, rot_secs, rot_bytes, token_clone).await {
-                                warn!("⚠️ Sesi terputus dengan {}: {}", peer_addr, e);
+                            if let Err(e) = handle_session(
+                                framed,
+                                storage_dir,
+                                rot_secs,
+                                rot_bytes,
+                                token_clone,
+                                peer_addr_str.clone(),
+                                local_addr_str,
+                                audit_clone,
+                            ).await {
+                                warn!("⚠️ Sesi terputus dengan {}: {}", peer_addr_str, e);
                             }
                         }
                         Err(e) => {
@@ -157,6 +192,7 @@ async fn run_reconnect_loop(
     privkey: &[u8],
     pubkey: &[u8],
     pairing_token: Arc<String>,
+    audit_logger: Arc<AuditLogger>,
 ) -> Result<()> {
     let mut backoff = 1u64;
     let max_backoff = 60u64;
@@ -166,6 +202,9 @@ async fn run_reconnect_loop(
         match TcpStream::connect(&args.addr).await {
             Ok(stream) => {
                 info!("🌐 Koneksi TCP terbuka ke {}. Memulai Noise handshake...", args.addr);
+                let local_addr_str = stream.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "0.0.0.0".into());
+                let peer_addr_str = args.addr.clone();
+                let audit_clone = audit_logger.clone();
                 match NoiseFramedStream::accept_as_responder(stream, privkey, pubkey).await {
                     Ok(framed) => {
                         info!("🔒 Handshake terenkripsi sukses!");
@@ -176,6 +215,9 @@ async fn run_reconnect_loop(
                             args.key_rotation_secs,
                             args.key_rotation_bytes,
                             pairing_token.clone(),
+                            peer_addr_str,
+                            local_addr_str,
+                            audit_clone,
                         )
                         .await
                         {
@@ -213,30 +255,37 @@ async fn handle_session(
     key_rotation_secs: u64,
     key_rotation_bytes: u64,
     pairing_token: Arc<String>,
+    peer_addr: String,
+    local_addr: String,
+    audit: Arc<AuditLogger>,
 ) -> Result<()> {
     // 1. Verifikasi Otorisasi Client
     let remote_pubkey_opt = stream.get_remote_static().map(|k| k.to_vec());
-    let is_authorized = match &remote_pubkey_opt {
-        Some(k) => is_client_authorized(k),
-        None => false,
-    };
+    let authorized_nickname_opt = remote_pubkey_opt.as_ref().and_then(|k| lookup_authorized_client(k));
+    let is_authorized = authorized_nickname_opt.is_some();
 
     let client_fingerprint = remote_pubkey_opt
         .as_ref()
         .map(|k| compute_key_fingerprint(k))
         .unwrap_or_else(|| "Unknown".to_string());
 
+    let mut audit_ctx = AuditSessionContext::new(peer_addr, local_addr, client_fingerprint.clone());
+    audit_ctx.set_nickname(authorized_nickname_opt.clone());
+
     if is_authorized {
         info!("🔑 Client terotorisasi (Fingerprint: {}).", client_fingerprint);
+        audit.log_auth_success(&audit_ctx, "publickey", audit_ctx.client_nickname.as_deref()).await;
         stream.send_response(&CommandResponse::AuthSuccess).await?;
     } else {
         info!("🔒 Client baru/belum terdaftar (Fingerprint: {}). Mengirim AuthChallenge...", client_fingerprint);
+        audit.log_auth_attempt(&audit_ctx, "challenge").await;
         stream.send_response(&CommandResponse::AuthChallenge).await?;
 
         let first_cmd = match stream.recv_command().await {
             Ok(c) => c,
             Err(e) => {
                 info!("Client memutus koneksi saat ditantang autentikasi: {}", e);
+                audit.log_auth_failed(&audit_ctx, "Koneksi terputus saat challenge").await;
                 return Ok(());
             }
         };
@@ -256,6 +305,8 @@ async fn handle_session(
                             warn!("Gagal menyimpan authorized_client: {}", e);
                         }
                     }
+                    audit_ctx.set_nickname(Some(client_label.clone()));
+                    audit.log_auth_success(&audit_ctx, "token_pairing", Some(&client_label)).await;
                     info!(
                         "✅ Pairing Client berhasil! Public key ({}) [{}] disimpan ke ~/.p/authorized_clients",
                         client_fingerprint, client_label
@@ -263,12 +314,14 @@ async fn handle_session(
                     stream.send_response(&CommandResponse::AuthSuccess).await?;
                 } else {
                     warn!("❌ Token autentikasi dari Client ({}) salah!", client_fingerprint);
+                    audit.log_auth_failed(&audit_ctx, "Password / Pairing Token salah").await;
                     let _ = stream.send_response(&CommandResponse::AuthFailed("Password / Pairing Token salah!".into())).await;
                     bail!("Autentikasi Client gagal: token salah.");
                 }
             }
             _ => {
                 warn!("Client mengirim perintah tanpa autentikasi!");
+                audit.log_auth_failed(&audit_ctx, "Perintah dikirim sebelum autentikasi").await;
                 let _ = stream.send_response(&CommandResponse::AuthFailed("Autentikasi dibutuhkan terlebih dahulu!".into())).await;
                 bail!("Client tidak terautentikasi.");
             }
@@ -309,6 +362,7 @@ async fn handle_session(
                     }
 
                     RemoteCommand::FsListDir { path } => {
+                        audit.log_fs_operation(&audit_ctx, "LIST", &path, "SUCCESS").await;
                         let target = resolve_safe_path(&storage_dir, &path);
                         match std::fs::read_dir(&target) {
                             Ok(read_dir) => {
@@ -344,6 +398,7 @@ async fn handle_session(
                     }
 
                     RemoteCommand::FsStat { path } => {
+                        audit.log_fs_operation(&audit_ctx, "STAT", &path, "SUCCESS").await;
                         let target = resolve_safe_path(&storage_dir, &path);
                         match std::fs::metadata(&target) {
                             Ok(meta) => {
@@ -374,6 +429,7 @@ async fn handle_session(
                     }
 
                     RemoteCommand::FsReadFile { path, offset, length } => {
+                        audit.log_fs_operation(&audit_ctx, "READ", &path, "SUCCESS").await;
                         let target = resolve_safe_path(&storage_dir, &path);
                         let read_res = (|| -> std::io::Result<Vec<u8>> {
                             use std::io::{Read, Seek, SeekFrom};
@@ -395,6 +451,7 @@ async fn handle_session(
                     }
 
                     RemoteCommand::FsWriteFile { path, data, truncate } => {
+                        audit.log_fs_operation(&audit_ctx, if truncate { "WRITE_TRUNCATE" } else { "WRITE_APPEND" }, &path, "SUCCESS").await;
                         let target = resolve_safe_path(&storage_dir, &path);
                         if let Some(parent) = target.parent() {
                             let _ = std::fs::create_dir_all(parent);
@@ -422,6 +479,7 @@ async fn handle_session(
                     }
 
                     RemoteCommand::FsDelete { path } => {
+                        audit.log_fs_operation(&audit_ctx, "DELETE", &path, "SUCCESS").await;
                         let target = resolve_safe_path(&storage_dir, &path);
                         let del_res = if target.is_dir() {
                             std::fs::remove_dir_all(&target)
@@ -439,6 +497,7 @@ async fn handle_session(
                     }
 
                     RemoteCommand::FsMkdir { path } => {
+                        audit.log_fs_operation(&audit_ctx, "MKDIR", &path, "SUCCESS").await;
                         let target = resolve_safe_path(&storage_dir, &path);
                         match std::fs::create_dir_all(&target) {
                             Ok(()) => {
@@ -451,6 +510,7 @@ async fn handle_session(
                     }
 
                     RemoteCommand::FsRename { from, to } => {
+                        audit.log_fs_operation(&audit_ctx, &format!("RENAME_TO:{}", to), &from, "SUCCESS").await;
                         let target_from = resolve_safe_path(&storage_dir, &from);
                         let target_to = resolve_safe_path(&storage_dir, &to);
                         match std::fs::rename(&target_from, &target_to) {
@@ -465,6 +525,7 @@ async fn handle_session(
 
                     RemoteCommand::RunTerminal(command_str) => {
                         info!("💻 Menjalankan perintah terminal: {}", command_str);
+                        audit.log_command_exec(&audit_ctx, &command_str).await;
                         let (stdout, stderr) = match execute_os_command(&command_str) {
                             Ok(out) => (out, String::new()),
                             Err(err) => (String::new(), err),
@@ -474,6 +535,7 @@ async fn handle_session(
 
                     RemoteCommand::GetSystemStats => {
                         info!("📊 Membaca metrik performa sistem (CPU & RAM)...");
+                        audit.log_event("SYSTEM_STATS", "INFO", &audit_ctx, "\"action\":\"GET_STATS\"").await;
                         let (cpu_usage, ram_used_mb) = get_system_stats();
                         stream.send_response(&CommandResponse::SystemStats {
                             cpu_usage,
@@ -483,6 +545,7 @@ async fn handle_session(
 
                     RemoteCommand::ShutdownDevice => {
                         info!("🛑 Menerima perintah shutdown perangkat!");
+                        audit.log_shutdown(&audit_ctx).await;
                         match shutdown_system() {
                             Ok(msg) => {
                                 stream.send_response(&CommandResponse::TerminalOutput {
@@ -498,6 +561,7 @@ async fn handle_session(
 
                     RemoteCommand::StartFileTransfer { filename, total_chunks } => {
                         info!("📥 Memulai penerimaan file: {} (total {} chunk)", filename, total_chunks);
+                        audit.log_file_upload(&audit_ctx, &filename, total_chunks, "START").await;
                         let file_path = storage_dir.join(Path::new(&filename).file_name().unwrap_or(filename.as_ref()));
                         match OpenOptions::new()
                             .create(true)
@@ -516,7 +580,7 @@ async fn handle_session(
                                 stream.send_response(&CommandResponse::FileChunkAck {
                                     chunk_index: 0,
                                     success: true,
-                                }).await?;
+                                    }).await?;
                             }
                             Err(e) => {
                                 error!("Gagal membuat file {}: {}", file_path.display(), e);
@@ -538,6 +602,7 @@ async fn handle_session(
                                 success = true;
                                 if state.received_chunks >= state.total_chunks {
                                     let _ = state.file.flush().await;
+                                    audit.log_file_upload(&audit_ctx, &state.filename, state.total_chunks, "SUCCESS").await;
                                     info!("✅ File {} selesai diterima ({} chunks)!", state.filename, state.total_chunks);
                                 }
                             }
@@ -555,6 +620,7 @@ async fn handle_session(
                                         let file_size = meta.len();
                                         let total_chunks = ((file_size + 32768 - 1) / 32768) as u32;
                                         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        audit.log_file_download(&audit_ctx, &filepath, file_size, "START").await;
                                         current_download = Some(file);
                                         stream.send_response(&CommandResponse::DownloadHeader {
                                             filename,
@@ -591,6 +657,7 @@ async fn handle_session(
 
                     RemoteCommand::RequestKeyRotation => {
                         info!("🔑 Permintaan pemutaran kunci diterima. Memutar kunci...");
+                        audit.log_rekey(&audit_ctx).await;
                         if let Err(e) = stream.rekey() {
                             stream.send_response(&CommandResponse::ExecutionError(format!("Rekey failed: {}", e))).await?;
                         } else {
@@ -600,6 +667,7 @@ async fn handle_session(
 
                     RemoteCommand::OpenForwardChannel { channel_id, target_port } => {
                         info!("🔀 Membuka port forward channel {}: target port {}", channel_id, target_port);
+                        audit.log_port_forward_local(&audit_ctx, channel_id, target_port).await;
                         let target_addr = format!("127.0.0.1:{}", target_port);
 
                         match TcpStream::connect(&target_addr).await {
@@ -684,6 +752,7 @@ async fn handle_session(
                         match bind_res {
                             Ok(listener) => {
                                 info!("✅ Remote forward listening di port {}", bind_port);
+                                audit.log_port_forward_remote(&audit_ctx, bind_port, target_client_port, "LISTENING").await;
                                 stream.send_response(&CommandResponse::RemoteForwardAck {
                                     bind_port,
                                     success: true,
@@ -764,6 +833,7 @@ async fn handle_session(
                             }
                             Err(e) => {
                                 warn!("Gagal bind remote forward port {}: {}", bind_port, e);
+                                audit.log_port_forward_remote(&audit_ctx, bind_port, target_client_port, "FAILED").await;
                                 stream.send_response(&CommandResponse::RemoteForwardAck {
                                     bind_port,
                                     success: false,
@@ -775,6 +845,7 @@ async fn handle_session(
 
                     RemoteCommand::StopRemoteForward { bind_port } => {
                         info!("🛑 Menghentikan remote forward listener di port {}", bind_port);
+                        audit.log_event("PORT_FORWARD_REMOTE", "NOTICE", &audit_ctx, &format!("\"action\":\"STOP\",\"bind_port\":{}", bind_port)).await;
                         if let Some(stop_tx) = remote_listeners.lock().await.remove(&bind_port) {
                             let _ = stop_tx.send(());
                         }
@@ -784,5 +855,6 @@ async fn handle_session(
         }
     }
 
+    audit.log_session_close(&audit_ctx).await;
     Ok(())
 }

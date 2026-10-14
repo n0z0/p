@@ -58,6 +58,14 @@ struct Cli {
     #[arg(short = 'R', long = "forward-remote", value_name = "REMOTE:LOCAL")]
     pub forward_remote: Option<String>,
 
+    /// Path kustom ke file audit telemetri CTI (default: ~/.p/audit.log)
+    #[arg(long)]
+    pub audit_log: Option<PathBuf>,
+
+    /// Nonaktifkan pencatatan audit log telemetri CTI
+    #[arg(long)]
+    pub no_audit: bool,
+
     #[command(subcommand)]
     pub command: Option<ClientCommand>,
 }
@@ -136,6 +144,8 @@ async fn main() -> Result<()> {
             storage_dir: cli.storage_dir,
             key_rotation_secs: 3600,
             key_rotation_bytes: 1_073_741_824,
+            audit_log: cli.audit_log,
+            no_audit: cli.no_audit,
         };
         run_server(args).await
     }

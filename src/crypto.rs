@@ -237,11 +237,11 @@ pub fn save_known_server(addr: &str, pubkey_hex: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Memeriksa apakah kunci publik Client ada di daftar ~/.p/authorized_clients
-pub fn is_client_authorized(pubkey: &[u8]) -> bool {
+/// Memeriksa apakah kunci publik Client ada di daftar ~/.p/authorized_clients, mengembalikan nickname jika ada
+pub fn lookup_authorized_client(pubkey: &[u8]) -> Option<String> {
     let auth_file = get_config_dir().join("authorized_clients");
     if !auth_file.exists() {
-        return false;
+        return None;
     }
     let target_hex = hex::encode(pubkey).to_lowercase();
     if let Ok(content) = std::fs::read_to_string(auth_file) {
@@ -250,13 +250,23 @@ pub fn is_client_authorized(pubkey: &[u8]) -> bool {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let key_part = line.split_whitespace().next().unwrap_or("").to_lowercase();
+            let mut parts = line.splitn(2, '#');
+            let key_part = parts.next().unwrap_or("").trim().to_lowercase();
             if key_part == target_hex {
-                return true;
+                let nickname = parts
+                    .next()
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_else(|| "client".to_string());
+                return Some(nickname);
             }
         }
     }
-    false
+    None
+}
+
+/// Memeriksa apakah kunci publik Client ada di daftar ~/.p/authorized_clients
+pub fn is_client_authorized(pubkey: &[u8]) -> bool {
+    lookup_authorized_client(pubkey).is_some()
 }
 
 /// Menambahkan kunci publik Client ke ~/.p/authorized_clients
