@@ -11,16 +11,16 @@ use p::crypto::generate_keypair;
     name = "p",
     author,
     version,
-    about = "Lightweight Multiplatform Remote Control Agent & Controller"
+    about = "Lightweight Multiplatform Remote Access Tool (SSH-like Server & Client)"
 )]
 struct Cli {
     /// Alamat target remote (contoh: 1.2.3.4:9999).
-    /// Jika diisi, otomatis menjadi Controller (klien pengontrol).
-    /// Jika kosong, otomatis menjadi Agent (server/daemon).
+    /// Jika diisi, otomatis menjadi Client (klien pengontrol, mirip ssh).
+    /// Jika kosong, otomatis menjadi Server (daemon pelayan, mirip sshd).
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 
-    /// Port listen (untuk Agent), contoh: -p 9999
+    /// Port listen (untuk Server), contoh: -p 9999
     #[arg(short = 'p', long)]
     pub port: Option<u16>,
 
@@ -36,17 +36,17 @@ struct Cli {
     #[arg(long)]
     pub privkey: Option<String>,
 
-    /// Kunci publik milik target Agent (32-byte hex)
+    /// Kunci publik milik target Server (32-byte hex)
     #[arg(short = 'k', long)]
     pub agent_pubkey: Option<String>,
 
-    /// Folder penyimpanan file yang diterima (Agent)
+    /// Folder penyimpanan file yang diterima (Server)
     #[arg(long, default_value = "./storage")]
     pub storage_dir: PathBuf,
 
     /// Mode Reverse Connection (NAT/Firewall Traversal):
-    /// - Pada target/agent: `p 1.2.3.4:9999 -r` (agent menghubung balik ke controller)
-    /// - Pada controller: `p -r` atau `p -r -p 9999` (controller mendengarkan koneksi masuk dari agent)
+    /// - Pada server (di balik NAT): `p <IP_CLIENT>:9999 -r` (server menghubung keluar ke client)
+    /// - Pada client: `p -r` atau `p -r -p 9999` (client mendengarkan koneksi masuk dari server)
     #[arg(short = 'r', long = "reverse")]
     pub reverse: bool,
 
@@ -54,7 +54,7 @@ struct Cli {
     #[arg(short = 'L', long = "forward-local", value_name = "LOCAL:REMOTE")]
     pub forward_local: Option<String>,
 
-    /// Remote Port Forwarding (seperti ssh -R agent_port:controller_port), contoh: -R 9090:8080
+    /// Remote Port Forwarding (seperti ssh -R remote_port:local_port), contoh: -R 9090:8080
     #[arg(short = 'R', long = "forward-remote", value_name = "REMOTE:LOCAL")]
     pub forward_remote: Option<String>,
 

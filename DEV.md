@@ -14,59 +14,63 @@ Sistem ini memangkas seluruh *overhead* tradisional dengan mengombinasikan kompo
 
 ---
 
-## 🧠 Konsep & Peran: Agent vs. Controller
+## 🧠 Konsep & Peran: Server vs. Client (Filosofi SSH)
 
-Dalam sistem kendali jarak jauh ini, komponen aplikasi dibagi menjadi dua modul terpisah dengan peran yang tidak sama rata:
+Dalam sistem `p`, komponen dibagi menjadi dua peran yang mengadopsi standar **SSH**:
 
 ```text
 ┌─────────────────────────────────┐                 ┌─────────────────────────────────┐
-│           CONTROLLER            │                 │              AGENT              │
+│             CLIENT              │                 │             SERVER              │
 │  (Laptop / PC Administrator)    │                 │ (Server / VPS / Perangkat IoT)  │
 │                                 │                 │                                 │
 │  • Pihak yang MEMERINTAH        │    Noise TCP    │  • Pihak yang DIKENDALIKAN      │
-│  • Antarmuka CLI Interaktif     │ ──────────────> │  • Daemon Ringan (Tanpa UI)     │
+│  • Antarmuka CLI Interaktif     │ ──────────────> │  • Daemon Ringan (Multi-Client) │
 │  • Port Forwarding Client (-L)  │                 │  • Eksekusi Terminal & OS CMD   │
 │  • Membaca Stat & Unduh File    │                 │  • Monitoring RAM & CPU Lokal   │
 └─────────────────────────────────┘                 └─────────────────────────────────┘
 ```
 
-### 1. 🤖 **Agent** (Target Remote / Service Daemon)
-* **Peran:** Sebagai pihak yang **melayani instruksi**. Agent berjalan di latar belakang (daemon), mengeksekusi perintah terminal OS (`cmd` / `bash`), membaca utilisasi RAM & CPU, menyimpan potongan file (*chunk transfer*), dan meneruskan lalu lintas jaringan ke port internal lokal (seperti database MySQL `3306` atau web server `80`).
+### 1. 🤖 **Server** (Target Remote / Service Daemon — Mirip `sshd`)
+* **Peran:** Sebagai pihak yang **melayani instruksi**. Server berjalan di latar belakang (daemon), mengeksekusi perintah terminal OS (`cmd` / `bash`), membaca utilisasi RAM & CPU, menyimpan potongan file (*chunk transfer*), dan meneruskan lalu lintas jaringan ke port internal lokal (seperti database MySQL `3306` atau web server `80`).
+* **Multi-Client Concurrency:** Server mendukung banyak Client sekaligus. Setiap koneksi Client yang masuk diterima di `listener.accept()` dan langsung di-spawn ke task `tokio::spawn` asynchronous mandiri dengan sesi enkripsi Noise yang terisolasi.
 
-### 2. 🎮 **Controller** (Admin Client Tool)
-* **Peran:** Sebagai **pusat kendali**. Controller adalah aplikasi CLI interaktif yang Anda gunakan untuk mengirim instruksi jarak jauh (`stats`, `exec`, `upload`, `rekey`, `-L`, `-R`, `mount`).
+### 2. 🎮 **Client** (Admin Tool — Mirip `ssh`)
+* **Peran:** Sebagai **pusat kendali**. Client adalah aplikasi CLI interaktif yang Anda gunakan untuk mengirim instruksi jarak jauh (`stats`, `exec`, `upload`, `rekey`, `-L`, `-R`, `mount`).
 
 ### 🔄 Hubungan Client vs. Server
 
-| Sudut Pandang | **Controller** | **Agent** | Penjelasan |
+| Sudut Pandang | **Client** | **Server** | Penjelasan |
 | :--- | :--- | :--- | :--- |
-| **Logika Bisnis (Aplikasi)** | **Client** | **Server** | Controller bertindak sebagai pemohon/pemberi instruksi (*master*), sedangkan Agent adalah penyedia eksekusi (*worker*). |
-| **Koneksi Jaringan Direct** | **Client** (`connect`) | **Server** (`listen`) | Digunakan jika target/Agent memiliki IP Publik atau berada di satu jaringan lokal yang bisa diakses langsung oleh Controller. |
-| **Koneksi Jaringan Reverse (`-r`)** | **Server Hub** (`listen`) | **Client** (`connect` + *Auto-Reconnect*) | **Skenario Enterprise:** Agent berada di balik firewall/NAT perusahaan. Agent berinisiatif menghubungi Controller dengan strategi *Exponential Backoff*. Begitu terhubung, Controller tetap memegang kendali penuh. |
+| **Logika Bisnis (Aplikasi)** | **Client** | **Server** | Client bertindak sebagai pemohon/pemberi instruksi (*master*), sedangkan Server adalah penyedia eksekusi (*worker*). |
+| **Koneksi Jaringan Direct** | **Client** (`connect`) | **Server** (`listen`) | Digunakan jika Server memiliki IP Publik atau berada di satu jaringan lokal yang bisa diakses langsung oleh Client. |
+| **Koneksi Jaringan Reverse (`-r`)** | **Client Hub** (`listen`) | **Server** (`connect` + *Auto-Reconnect*) | **Skenario Enterprise:** Server berada di balik firewall/NAT perusahaan. Server berinisiatif menghubungi Client dengan strategi *Exponential Backoff*. Begitu terhubung, Client tetap memegang kendali penuh. |
 
 ---
 
 ## 🛡️ Fitur Lanjutan & Ketahanan Sistem
 
-1. **Auto-Reconnect (Resiliensi Jaringan):**
-   * Jika koneksi TCP terputus akibat gangguan jaringan, Agent tidak mati (*crash*).
+1. **Multi-Client Async Concurrency:**
+   * Server dapat melayani banyak koneksi Client secara simultan tanpa saling memblokir (non-blocking async via Tokio).
+
+2. **Auto-Reconnect (Resiliensi Jaringan):**
+   * Jika koneksi TCP terputus akibat gangguan jaringan, Server/Client tidak mati (*crash*).
    * Menggunakan strategi **Exponential Backoff** (1s, 2s, 4s, hingga maksimal 60s) untuk mencegah *Thundering Herd*.
 
-2. **File Transfer Terintegrasi Dua Arah (Chunk-Based):**
+3. **File Transfer Terintegrasi Dua Arah (Chunk-Based):**
    * Pengiriman file (`upload`) maupun penarikan file (`download`).
    * Seluruh proses menggunakan pembagian potongan data (*chunking* 32 KB) dengan konfirmasi indeks (`FileChunkAck`), mencegah lonjakan RAM pada perangkat berdaya rendah.
 
-3. **Periodic Key Rotation (Pemutaran Kunci Berkala):**
+4. **Periodic Key Rotation (Pemutaran Kunci Berkala):**
    * Otomatis memutar kunci simetris sesi Noise secara berkala berdasarkan batas waktu (misal 1 jam) atau volume data (1 GB) via `RemoteCommand::RequestKeyRotation`.
 
-4. **Multiplexed Port Forwarding (`-L` & `-R`):**
+5. **Multiplexed Port Forwarding (`-L` & `-R`):**
    * Local Port Forwarding (`-L`) dan Remote Port Forwarding (`-R`).
    * Seluruh lalu lintas data port forwarding menumpang di dalam satu koneksi Raw TCP Noise utama (Multiplexing) menggunakan identifikasi `channel_id`.
 
-5. **Manajemen Kunci Bergaya SSH (TOFU - Trust On First Use):**
+6. **Manajemen Kunci Bergaya SSH (TOFU - Trust On First Use):**
    * **Host Key Persisten:** Disimpan di `~/.p/agent.key` dan `~/.p/controller.key`.
-   * **Auto-Discovery Kunci Publik:** Controller melakukan probe TOFU, memverifikasi Fingerprint (SHA-256), dan mencatatnya ke `~/.p/known_agents`.
-   * **Pairing Token:** Melindungi akses awal dengan token rahasia di `~/.p/agent.token` dan mencatat controller terotorisasi di `~/.p/authorized_controllers`.
+   * **Auto-Discovery Kunci Publik:** Client melakukan probe TOFU, memverifikasi Fingerprint (SHA-256), dan mencatatnya ke `~/.p/known_agents`.
+   * **Pairing Token:** Melindungi akses awal dengan token rahasia di `~/.p/agent.token` dan mencatat Client terotorisasi di `~/.p/authorized_controllers`.
 
 ---
 

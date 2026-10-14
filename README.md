@@ -1,8 +1,12 @@
 # p
 
-**Ultra-Lightweight Multiplatform Remote Control & Access Tool**
+**Ultra-Lightweight Multiplatform Remote Access Tool (SSH-like Server & Client)**
 
-`p` adalah alat kendali jarak jauh (remote access) lintas platform (Windows, Linux, macOS) yang dibangun dengan **Rust**. Dirancang sebagai alternatif modern yang sangat ringan (< 8 MB RAM), cepat, aman dengan enkripsi *end-to-end* Noise Protocol sekelas WireGuard, dan praktis tanpa konfigurasi rumit (*zero-config single binary*).
+`p` adalah alat akses dan kendali jarak jauh (remote access) lintas platform (Windows, Linux, macOS) yang dibangun dengan **Rust**. Dirancang sebagai alternatif modern yang sangat ringan (< 8 MB RAM), cepat, aman dengan enkripsi *end-to-end* Noise Protocol sekelas WireGuard, dan praktis tanpa konfigurasi rumit (*zero-config single binary*).
+
+Menggunakan filosofi dan terminologi yang sama dengan **SSH**:
+* **Server** (seperti `sshd`): Berjalan di komputer/server target. Menunggu koneksi, melayani eksekusi terminal, transfer file, dan mounting drive. **Mendukung banyak klien sekaligus (multi-client)** secara *asynchronous* melalui Tokio.
+* **Client** (seperti `ssh`): Berjalan di laptop/komputer admin untuk terhubung ke Server, masuk ke interactive shell, transfer file, atau tunneling port.
 
 ---
 
@@ -26,25 +30,27 @@ curl -fsSL https://raw.githubusercontent.com/n0z0/p/main/install.sh | bash
 
 ## 🚀 Quick Start (Cara Penggunaan)
 
-Seluruh fungsi tergabung dalam satu file biner: **`p`**.
+Seluruh fungsi Server dan Client tergabung dalam satu file biner tunggal: **`p`**.
 
-### 1. Menjalankan di Target / Server (Mode Agent)
-Jalankan `p` tanpa argumen di komputer/server yang ingin dikendalikan. Server otomatis mendengarkan koneksi di port default `9999`:
+### 1. Menjalankan Server di Komputer Target (seperti `sshd`)
+Jalankan `p` tanpa argumen di komputer atau server yang ingin dikendalikan:
 
 ```bash
-# Jalankan agent di port default 9999:
+# Jalankan Server di port default 9999:
 p
 
 # Atau tentukan port kustom:
 p -p 8080
 ```
 
-> **Catatan Keamanan:** Saat pertama kali dijalankan, `p` otomatis membuat kunci persisten di `~/.p/agent.key` dan menampilkan **Pairing Token** (password otorisasi satu kali) untuk menghubungkan Controller pertama kali.
+> **Catatan Multi-Client & Keamanan:**
+> * **Multi-Client:** Server otomatis melayani banyak Client secara bersamaan (*concurrent*). Tiap koneksi Client diisolasi dalam thread async (`tokio::spawn`) dengan kunci sesi enkripsinya masing-masing.
+> * **Pairing Token:** Saat pertama kali dijalankan, Server membuat kunci host di `~/.p/agent.key` dan menampilkan **Pairing Token** (password otorisasi) untuk Client pertama kali.
 
 ---
 
-### 2. Menghubungkan dari Komputer Admin (Interactive Shell)
-Cukup tentukan alamat target server untuk masuk ke sesi remote shell interaktif (seperti SSH):
+### 2. Menghubungkan Client dari Laptop Admin (seperti `ssh`)
+Cukup tentukan alamat target Server untuk masuk ke sesi remote shell interaktif:
 
 ```bash
 p 1.2.3.4:9999
@@ -52,17 +58,17 @@ p 1.2.3.4:9999
 
 **Tampilan Sesi Interaktif:**
 ```text
-🔍 Menghubungi Agent di 1.2.3.4:9999 untuk mengambil identitas kunci publik (TOFU)...
-🔒 KUNCI PUBLIK AGENT TERVERIFIKASI: SHA256:4b...
-🔒 Agent membutuhkan otorisasi untuk Controller baru.
+🔍 Menghubungi Server di 1.2.3.4:9999 untuk verifikasi kunci publik (TOFU)...
+🔒 KUNCI PUBLIK SERVER TERVERIFIKASI: SHA256:4b...
+🔒 Server membutuhkan otorisasi untuk Client baru.
 🔑 Masukkan Password / Pairing Token: ********
-✅ Pairing berhasil! Kunci Controller telah diotorisasi di Agent (~/.p/authorized_controllers).
+✅ Pairing berhasil! Kunci Client telah diotorisasi di Server (~/.p/authorized_controllers).
 
 ══════════════════════════════════════════════════════════
 💻 SESI INTERAKTIF REMOTE SHELL (p)
-   Target Host : 1.2.3.4:9999
-   Bantuan     : Ketik 'help' untuk daftar perintah khusus
-   Keluar      : Ketik 'exit' atau tekan Ctrl+C
+   Target Server : 1.2.3.4:9999
+   Bantuan       : Ketik 'help' untuk daftar perintah khusus
+   Keluar        : Ketik 'exit' atau tekan Ctrl+C
 ══════════════════════════════════════════════════════════
 p[1.2.3.4:9999]> whoami
 root
@@ -70,31 +76,31 @@ p[1.2.3.4:9999]> stats
 📊 CPU: 1.20% | RAM: 320 MB
 p[1.2.3.4:9999]> mount P:
 🔌 Menghubungkan drive P: ke File Explorer...
-✅ Berhasil! Remote files kini terbuka di Drive P:.
+✅ Berhasil! File server kini terbuka di Drive P:.
 p[1.2.3.4:9999]> exit
 ```
 
-> **Zero-Friction:** Pada koneksi berikutnya, Controller langsung terhubung tanpa perlu memasukkan password lagi karena kunci Controller telah masuk whitelist `~/.p/authorized_controllers`.
+> **Zero-Friction:** Pada koneksi berikutnya, Client langsung terhubung tanpa perlu memasukkan token lagi karena kunci Client telah terdaftar di whitelist `~/.p/authorized_controllers` Server.
 
 ---
 
 ### 3. Menembus NAT / Firewall (`-r` / `--reverse`)
-Jika Server/Target berada di balik **NAT ketat, Firewall, atau Modem Seluler/4G** (tidak punya IP publik):
+Jika Server berada di balik **NAT ketat, Firewall, atau Modem Seluler/4G** (tidak memiliki IP publik):
 
-1. **Di Laptop/Server Admin (Listener):**
+1. **Di Laptop Client Admin (Menunggu sambungan Server):**
    ```bash
    p -r
    ```
-2. **Di Server/Target (Agent):**
+2. **Di Server Target (Menghubung keluar menembus NAT ke Client):**
    ```bash
    p <IP_LAPTOP_ADMIN>:9999 -r
    ```
-   *(Agent otomatis mencoba menghubung ulang jika koneksi internet terputus dengan fitur Auto-Reconnect Exponential Backoff)*
+   *(Server otomatis mencoba menghubung ulang jika koneksi terputus dengan fitur Auto-Reconnect Exponential Backoff)*
 
 ---
 
-### 4. Mount Remote Filesystem ke File Explorer Windows
-Buka dan kelola file server remote langsung dari File Explorer Windows layaknya flashdisk lokal:
+### 4. Mount Filesystem Server ke File Explorer Windows
+Buka dan kelola file Server secara visual langsung dari File Explorer Windows layaknya flashdisk lokal:
 
 * **Dari dalam sesi interaktif:**
   ```text
@@ -111,19 +117,19 @@ Buka dan kelola file server remote langsung dari File Explorer Windows layaknya 
 ### 5. Port Forwarding Bergaya SSH (`-L` & `-R`)
 
 #### Local Port Forwarding (`-L`)
-Membuka port di komputer lokal yang diteruskan ke port internal server target:
+Membuka port di komputer Client yang diteruskan ke port internal Server:
 ```bash
 # Akses database MySQL server (port 3306) via localhost:3306:
 p 1.2.3.4:9999 -L 3306:3306
 
-# Akses web server internal target (port 80) via localhost:8080:
+# Akses web server internal server (port 80) via localhost:8080:
 p 1.2.3.4:9999 -L 8080:80
 ```
 
 #### Remote Port Forwarding (`-R`)
-Membuka port di sisi server target yang diteruskan kembali ke aplikasi di komputer Anda:
+Membuka port di sisi Server yang diteruskan kembali ke aplikasi di komputer Client:
 ```bash
-# Membuka port 9090 di server target yang mengarah ke localhost:8080 admin:
+# Membuka port 9090 di server target yang mengarah ke localhost:8080 client:
 p 1.2.3.4:9999 -R 9090:8080
 ```
 
@@ -132,22 +138,22 @@ p 1.2.3.4:9999 -R 9090:8080
 ### 6. Perintah Sekali Jalan (CLI Scripting Cheat Sheet)
 
 ```bash
-# Cek penggunaan CPU & RAM target
+# Cek penggunaan CPU & RAM Server
 p 1.2.3.4:9999 stats
 
 # Eksekusi perintah terminal tanpa masuk ke shell interaktif
 p 1.2.3.4:9999 exec "systemctl restart nginx"
 
-# Upload file ke target
+# Upload file ke Server
 p 1.2.3.4:9999 upload ./project.zip
 
-# Download file dari target
+# Download file dari Server
 p 1.2.3.4:9999 download /var/log/nginx/access.log ./access.log
 
 # Rotasi kunci sesi enkripsi Noise
 p 1.2.3.4:9999 rekey
 
-# Matikan server target dari jarak jauh
+# Matikan Server dari jarak jauh
 p 1.2.3.4:9999 shutdown
 
 # Buat pasangan kunci kriptografi Noise baru
