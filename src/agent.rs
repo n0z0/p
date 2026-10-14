@@ -221,17 +221,22 @@ async fn handle_session(
         None => false,
     };
 
+    let client_fingerprint = remote_pubkey_opt
+        .as_ref()
+        .map(|k| compute_key_fingerprint(k))
+        .unwrap_or_else(|| "Unknown".to_string());
+
     if is_authorized {
-        info!("🔑 Controller terotorisasi (ada di ~/.p/authorized_controllers).");
+        info!("🔑 Client terotorisasi (Fingerprint: {}).", client_fingerprint);
         stream.send_response(&CommandResponse::AuthSuccess).await?;
     } else {
-        info!("🔒 Controller baru/belum terdaftar. Mengirim AuthChallenge...");
+        info!("🔒 Client baru/belum terdaftar (Fingerprint: {}). Mengirim AuthChallenge...", client_fingerprint);
         stream.send_response(&CommandResponse::AuthChallenge).await?;
 
         let first_cmd = match stream.recv_command().await {
             Ok(c) => c,
             Err(e) => {
-                info!("Controller memutus koneksi saat ditantang autentikasi: {}", e);
+                info!("Client memutus koneksi saat ditantang autentikasi: {}", e);
                 return Ok(());
             }
         };
@@ -240,16 +245,22 @@ async fn handle_session(
             RemoteCommand::Authenticate { token } => {
                 if token.trim() == pairing_token.as_str() {
                     if let Some(ref k) = remote_pubkey_opt {
-                        if let Err(e) = add_authorized_controller(k, Some("paired-controller")) {
+                        let short_id = if client_fingerprint.len() >= 15 {
+                            &client_fingerprint[7..15]
+                        } else {
+                            "client"
+                        };
+                        let comment = format!("client-{}", short_id);
+                        if let Err(e) = add_authorized_controller(k, Some(&comment)) {
                             warn!("Gagal menyimpan authorized_controller: {}", e);
                         }
                     }
-                    info!("✅ Pairing Controller berhasil! Public key disimpan ke ~/.p/authorized_controllers");
+                    info!("✅ Pairing Client berhasil! Public key ({}) disimpan ke ~/.p/authorized_controllers", client_fingerprint);
                     stream.send_response(&CommandResponse::AuthSuccess).await?;
                 } else {
-                    warn!("❌ Token autentikasi dari Controller salah!");
+                    warn!("❌ Token autentikasi dari Client ({}) salah!", client_fingerprint);
                     let _ = stream.send_response(&CommandResponse::AuthFailed("Password / Pairing Token salah!".into())).await;
-                    bail!("Autentikasi Controller gagal: token salah.");
+                    bail!("Autentikasi Client gagal: token salah.");
                 }
             }
             _ => {
