@@ -242,20 +242,24 @@ async fn handle_session(
         };
 
         match first_cmd {
-            RemoteCommand::Authenticate { token } => {
+            RemoteCommand::Authenticate { token, nickname } => {
                 if token.trim() == pairing_token.as_str() {
-                    if let Some(ref k) = remote_pubkey_opt {
-                        let short_id = if client_fingerprint.len() >= 15 {
-                            &client_fingerprint[7..15]
+                    let client_label = nickname.unwrap_or_else(|| {
+                        if client_fingerprint.len() >= 15 {
+                            format!("client-{}", &client_fingerprint[7..15])
                         } else {
-                            "client"
-                        };
-                        let comment = format!("client-{}", short_id);
-                        if let Err(e) = add_authorized_controller(k, Some(&comment)) {
+                            "client".to_string()
+                        }
+                    });
+                    if let Some(ref k) = remote_pubkey_opt {
+                        if let Err(e) = add_authorized_controller(k, Some(&client_label)) {
                             warn!("Gagal menyimpan authorized_controller: {}", e);
                         }
                     }
-                    info!("✅ Pairing Client berhasil! Public key ({}) disimpan ke ~/.p/authorized_controllers", client_fingerprint);
+                    info!(
+                        "✅ Pairing Client berhasil! Public key ({}) [{}] disimpan ke ~/.p/authorized_controllers",
+                        client_fingerprint, client_label
+                    );
                     stream.send_response(&CommandResponse::AuthSuccess).await?;
                 } else {
                     warn!("❌ Token autentikasi dari Client ({}) salah!", client_fingerprint);

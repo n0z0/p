@@ -21,7 +21,7 @@ pub enum RemoteCommand {
     CloseForwardChannel { channel_id: u32 },
 
     // Autentikasi / Pairing
-    Authenticate { token: String },
+    Authenticate { token: String, nickname: Option<String> },
 
     // Remote Virtual Drive / Filesystem Operations
     FsListDir { path: String },

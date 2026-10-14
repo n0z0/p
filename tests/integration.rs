@@ -581,7 +581,8 @@ async fn test_pairing_token_authentication() {
         // 2. Expect Authenticate command
         let cmd = framed.recv_command().await.unwrap();
         match cmd {
-            RemoteCommand::Authenticate { token } => {
+            RemoteCommand::Authenticate { token, nickname } => {
+                assert_eq!(nickname.as_deref(), Some("test-admin@laptop"));
                 if token == expected_token {
                     framed.send_response(&CommandResponse::AuthSuccess).await.unwrap();
                 } else {
@@ -607,8 +608,11 @@ async fn test_pairing_token_authentication() {
     let challenge = controller.recv_response().await.unwrap();
     assert_eq!(challenge, CommandResponse::AuthChallenge);
 
-    // Send correct token
-    controller.send_command(&RemoteCommand::Authenticate { token: expected_token.into() }).await.unwrap();
+    // Send correct token with nickname
+    controller.send_command(&RemoteCommand::Authenticate {
+        token: expected_token.into(),
+        nickname: Some("test-admin@laptop".into()),
+    }).await.unwrap();
     let auth_ack = controller.recv_response().await.unwrap();
     assert_eq!(auth_ack, CommandResponse::AuthSuccess);
 

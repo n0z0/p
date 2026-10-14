@@ -644,9 +644,9 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
             info!("🔑 Controller telah terotorisasi otomatis (terdaftar di ~/.p/authorized_controllers Agent).");
         }
         CommandResponse::AuthChallenge => {
-            println!("🔒 Agent membutuhkan otorisasi untuk Controller baru.");
+            println!("🔒 Server membutuhkan otorisasi untuk Client baru.");
             let token = match args.token {
-                Some(t) => t.trim().to_string(),
+                Some(ref t) => t.trim().to_string(),
                 None => {
                     use std::io::{self, Write};
                     print!("🔑 Masukkan Password / Pairing Token: ");
@@ -657,13 +657,37 @@ pub async fn run_controller(args: ControllerArgs) -> Result<()> {
                 }
             };
 
-            stream.send_command(&RemoteCommand::Authenticate { token }).await?;
+            let username = std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "admin".into());
+            let hostname = std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .unwrap_or_else(|_| "client".into());
+            let default_nick = format!("{}@{}", username, hostname);
+
+            let nickname = if args.token.is_some() {
+                default_nick
+            } else {
+                use std::io::{self, Write};
+                print!("🏷️  Nama Perangkat / Nickname [{}]: ", default_nick);
+                let _ = io::stdout().flush();
+                let mut nick_input = String::new();
+                let _ = io::stdin().read_line(&mut nick_input);
+                let trimmed = nick_input.trim();
+                if trimmed.is_empty() {
+                    default_nick
+                } else {
+                    trimmed.to_string()
+                }
+            };
+
+            stream.send_command(&RemoteCommand::Authenticate { token, nickname: Some(nickname) }).await?;
             let auth_res = stream.recv_response().await
-                .context("Gagal menerima hasil verifikasi autentikasi dari Agent")?;
+                .context("Gagal menerima hasil verifikasi autentikasi dari Server")?;
 
             match auth_res {
                 CommandResponse::AuthSuccess => {
-                    println!("✅ Pairing berhasil! Kunci Controller telah diotorisasi di Agent.");
+                    println!("✅ Pairing berhasil! Kunci Client telah diotorisasi di Server.");
                     println!("💡 Pada koneksi berikutnya, Anda tidak perlu memasukkan password lagi!");
                     println!();
                 }
