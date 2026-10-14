@@ -31,7 +31,7 @@ pub struct NoiseFramedStream {
 }
 
 impl NoiseFramedStream {
-    /// Probe stream untuk mengambil public key Agent secara remote jika stream sudah terbuka
+    /// Probe stream untuk mengambil public key Server secara remote jika stream sudah terbuka
     pub async fn probe_stream_for_pubkey(stream: TcpStream) -> Result<Vec<u8>, FrameError> {
         let mut framed = LengthDelimitedCodec::builder()
             .length_field_length(4)
@@ -55,7 +55,7 @@ impl NoiseFramedStream {
         }
     }
 
-    /// Probe cepat untuk mengunduh kunci publik Agent (TOFU / Trust On First Use)
+    /// Probe cepat untuk mengunduh kunci publik Server (TOFU / Trust On First Use)
     pub async fn discover_remote_pubkey(addr: &str) -> Result<Vec<u8>, FrameError> {
         let stream = TcpStream::connect(addr).await?;
         Self::probe_stream_for_pubkey(stream).await
@@ -96,7 +96,7 @@ impl NoiseFramedStream {
         Ok(Self { framed, session })
     }
 
-    /// Inisialisasi koneksi dari sisi Initiator (Client/Controller) dengan Handshake Noise IK
+    /// Inisialisasi koneksi dari sisi Initiator (Client) dengan Handshake Noise IK
     pub async fn connect_as_initiator(
         addr: &str,
         local_privkey: &[u8],
@@ -106,7 +106,7 @@ impl NoiseFramedStream {
         Self::handshake_as_initiator(stream, local_privkey, remote_pubkey).await
     }
 
-    /// Menerima koneksi masuk dari sisi Responder (Agent) dan menyelesaikan Handshake Noise IK
+    /// Menerima koneksi masuk dari sisi Responder (Server) dan menyelesaikan Handshake Noise IK
     pub async fn accept_as_responder(
         stream: TcpStream,
         local_privkey: &[u8],

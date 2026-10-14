@@ -23,7 +23,7 @@ pub fn generate_keypair() -> Result<Keypair, CryptoError> {
     Ok(builder.generate_keypair()?)
 }
 
-/// Helper untuk membuat initiator handshake (Controller)
+/// Helper untuk membuat initiator handshake (Client)
 pub fn create_initiator(
     local_privkey: &[u8],
     remote_pubkey: &[u8],
@@ -36,7 +36,7 @@ pub fn create_initiator(
     Ok(initiator)
 }
 
-/// Helper untuk membuat responder handshake (Target Agent)
+/// Helper untuk membuat responder handshake (Target Server)
 pub fn create_responder(local_privkey: &[u8]) -> Result<snow::HandshakeState, CryptoError> {
     let builder = Builder::new(NOISE_PATTERN.parse()?);
     let responder = builder.local_private_key(local_privkey).build_responder()?;
@@ -133,34 +133,19 @@ pub fn get_config_dir() -> std::path::PathBuf {
     }
 }
 
-/// Memuat atau membuat kunci host persisten milik Server (~/.p/server.key, fallback ~/.p/agent.key)
+/// Memuat atau membuat kunci host persisten milik Server (~/.p/server.key)
 pub fn load_or_create_server_key() -> Result<Keypair, CryptoError> {
     let dir = get_config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let key_file = dir.join("server.key");
     let pub_file = dir.join("server.pub");
-    let legacy_key = dir.join("agent.key");
-    let legacy_pub = dir.join("agent.pub");
 
-    let actual_key = if key_file.exists() {
-        key_file.clone()
-    } else if legacy_key.exists() {
-        legacy_key
-    } else {
-        key_file.clone()
-    };
-
-    if actual_key.exists() {
-        if let Ok(content) = std::fs::read_to_string(&actual_key) {
+    if key_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&key_file) {
             if let Ok(privkey) = hex::decode(content.trim()) {
                 if privkey.len() == 32 {
-                    let actual_pub = if pub_file.exists() {
-                        pub_file
-                    } else {
-                        legacy_pub
-                    };
-                    let pubkey = if actual_pub.exists() {
-                        hex::decode(std::fs::read_to_string(&actual_pub).unwrap_or_default().trim()).unwrap_or_default()
+                    let pubkey = if pub_file.exists() {
+                        hex::decode(std::fs::read_to_string(&pub_file).unwrap_or_default().trim()).unwrap_or_default()
                     } else {
                         Vec::new()
                     };
@@ -180,39 +165,19 @@ pub fn load_or_create_server_key() -> Result<Keypair, CryptoError> {
     Ok(keypair)
 }
 
-/// Alias backward compatibility untuk load_or_create_server_key
-pub fn load_or_create_agent_key() -> Result<Keypair, CryptoError> {
-    load_or_create_server_key()
-}
-
-/// Memuat atau membuat kunci host persisten milik Client (~/.p/client.key, fallback ~/.p/controller.key)
+/// Memuat atau membuat kunci host persisten milik Client (~/.p/client.key)
 pub fn load_or_create_client_key() -> Result<Keypair, CryptoError> {
     let dir = get_config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let key_file = dir.join("client.key");
     let pub_file = dir.join("client.pub");
-    let legacy_key = dir.join("controller.key");
-    let legacy_pub = dir.join("controller.pub");
 
-    let actual_key = if key_file.exists() {
-        key_file.clone()
-    } else if legacy_key.exists() {
-        legacy_key
-    } else {
-        key_file.clone()
-    };
-
-    if actual_key.exists() {
-        if let Ok(content) = std::fs::read_to_string(&actual_key) {
+    if key_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&key_file) {
             if let Ok(privkey) = hex::decode(content.trim()) {
                 if privkey.len() == 32 {
-                    let actual_pub = if pub_file.exists() {
-                        pub_file
-                    } else {
-                        legacy_pub
-                    };
-                    let pubkey = if actual_pub.exists() {
-                        hex::decode(std::fs::read_to_string(&actual_pub).unwrap_or_default().trim()).unwrap_or_default()
+                    let pubkey = if pub_file.exists() {
+                        hex::decode(std::fs::read_to_string(&pub_file).unwrap_or_default().trim()).unwrap_or_default()
                     } else {
                         Vec::new()
                     };
@@ -232,29 +197,23 @@ pub fn load_or_create_client_key() -> Result<Keypair, CryptoError> {
     Ok(keypair)
 }
 
-/// Mencari kunci publik yang sudah dikenal untuk suatu alamat di ~/.p/known_servers (fallback ~/.p/known_agents)
+/// Mencari kunci publik yang sudah dikenal untuk suatu alamat di ~/.p/known_servers
 pub fn lookup_known_server(addr: &str) -> Option<Vec<u8>> {
-    let files = [
-        get_config_dir().join("known_servers"),
-        get_config_dir().join("known_agents"),
-    ];
-
-    for known_file in &files {
-        if !known_file.exists() {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(known_file) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((saved_addr, key_hex)) = line.split_once('=') {
-                    if saved_addr.trim() == addr.trim() {
-                        if let Ok(bytes) = hex::decode(key_hex.trim()) {
-                            if bytes.len() == 32 {
-                                return Some(bytes);
-                            }
+    let known_file = get_config_dir().join("known_servers");
+    if !known_file.exists() {
+        return None;
+    }
+    if let Ok(content) = std::fs::read_to_string(known_file) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((saved_addr, key_hex)) = line.split_once('=') {
+                if saved_addr.trim() == addr.trim() {
+                    if let Ok(bytes) = hex::decode(key_hex.trim()) {
+                        if bytes.len() == 32 {
+                            return Some(bytes);
                         }
                     }
                 }
@@ -262,11 +221,6 @@ pub fn lookup_known_server(addr: &str) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-/// Alias backward compatibility untuk lookup_known_server
-pub fn lookup_known_agent(addr: &str) -> Option<Vec<u8>> {
-    lookup_known_server(addr)
 }
 
 /// Menyimpan kunci publik Server ke ~/.p/known_servers (TOFU)
@@ -283,42 +237,26 @@ pub fn save_known_server(addr: &str, pubkey_hex: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Alias backward compatibility untuk save_known_server
-pub fn save_known_agent(addr: &str, pubkey_hex: &str) -> std::io::Result<()> {
-    save_known_server(addr, pubkey_hex)
-}
-
-/// Memeriksa apakah kunci publik Client ada di daftar ~/.p/authorized_clients (fallback ~/.p/authorized_controllers)
+/// Memeriksa apakah kunci publik Client ada di daftar ~/.p/authorized_clients
 pub fn is_client_authorized(pubkey: &[u8]) -> bool {
-    let files = [
-        get_config_dir().join("authorized_clients"),
-        get_config_dir().join("authorized_controllers"),
-    ];
+    let auth_file = get_config_dir().join("authorized_clients");
+    if !auth_file.exists() {
+        return false;
+    }
     let target_hex = hex::encode(pubkey).to_lowercase();
-
-    for auth_file in &files {
-        if !auth_file.exists() {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(auth_file) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let key_part = line.split_whitespace().next().unwrap_or("").to_lowercase();
-                if key_part == target_hex {
-                    return true;
-                }
+    if let Ok(content) = std::fs::read_to_string(auth_file) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let key_part = line.split_whitespace().next().unwrap_or("").to_lowercase();
+            if key_part == target_hex {
+                return true;
             }
         }
     }
     false
-}
-
-/// Alias backward compatibility untuk is_client_authorized
-pub fn is_controller_authorized(pubkey: &[u8]) -> bool {
-    is_client_authorized(pubkey)
 }
 
 /// Menambahkan kunci publik Client ke ~/.p/authorized_clients
@@ -337,33 +275,19 @@ pub fn add_authorized_client(pubkey: &[u8], comment: Option<&str>) -> std::io::R
     Ok(())
 }
 
-/// Alias backward compatibility untuk add_authorized_client
-pub fn add_authorized_controller(pubkey: &[u8], comment: Option<&str>) -> std::io::Result<()> {
-    add_authorized_client(pubkey, comment)
-}
-
 /// Menghasilkan token pairing acak (format xxxx-xxxx)
 pub fn generate_pairing_token() -> String {
     format!("{:04x}-{:04x}", rand::random::<u16>(), rand::random::<u16>())
 }
 
-/// Memuat atau membuat token pairing rahasia milik Server (~/.p/server.token, fallback ~/.p/agent.token)
+/// Memuat atau membuat token pairing rahasia milik Server (~/.p/server.token)
 pub fn load_or_create_server_token() -> String {
     let dir = get_config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let token_file = dir.join("server.token");
-    let legacy_file = dir.join("agent.token");
 
-    let actual_file = if token_file.exists() {
-        token_file.clone()
-    } else if legacy_file.exists() {
-        legacy_file
-    } else {
-        token_file.clone()
-    };
-
-    if actual_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&actual_file) {
+    if token_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&token_file) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
@@ -373,11 +297,6 @@ pub fn load_or_create_server_token() -> String {
     let token = generate_pairing_token();
     let _ = std::fs::write(&token_file, &token);
     token
-}
-
-/// Alias backward compatibility untuk load_or_create_server_token
-pub fn load_or_create_agent_token() -> String {
-    load_or_create_server_token()
 }
 
 

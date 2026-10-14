@@ -37,7 +37,7 @@ struct Cli {
     pub privkey: Option<String>,
 
     /// Kunci publik milik target Server (32-byte hex)
-    #[arg(short = 'k', long = "server-pubkey", alias = "agent-pubkey")]
+    #[arg(short = 'k', long)]
     pub server_pubkey: Option<String>,
 
     /// Folder penyimpanan file yang diterima (Server)

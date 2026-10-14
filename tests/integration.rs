@@ -341,8 +341,8 @@ async fn test_remote_port_forwarding() {
         // Expect StartRemoteForward
         let cmd = framed.recv_command().await.unwrap();
         match cmd {
-            RemoteCommand::StartRemoteForward { bind_port, target_controller_port } => {
-                assert_eq!(target_controller_port, controller_app_port);
+            RemoteCommand::StartRemoteForward { bind_port, target_client_port } => {
+                assert_eq!(target_client_port, controller_app_port);
                 framed.send_response(&CommandResponse::RemoteForwardAck {
                     bind_port,
                     success: true,
@@ -390,7 +390,7 @@ async fn test_remote_port_forwarding() {
     // Request Agent to bind agent_bound_port
     controller.send_command(&RemoteCommand::StartRemoteForward {
         bind_port: agent_bound_port,
-        target_controller_port: controller_app_port,
+        target_client_port: controller_app_port,
     }).await.unwrap();
 
     let ack = controller.recv_response().await.unwrap();

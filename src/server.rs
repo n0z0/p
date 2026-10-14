@@ -49,8 +49,6 @@ pub struct ServerArgs {
     pub key_rotation_bytes: u64,
 }
 
-pub type AgentArgs = ServerArgs;
-
 struct FileTransferState {
     filename: String,
     total_chunks: u32,
@@ -107,10 +105,6 @@ pub async fn run_server(args: ServerArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub async fn run_agent(args: ServerArgs) -> Result<()> {
-    run_server(args).await
 }
 
 async fn run_listen_loop(
@@ -274,9 +268,9 @@ async fn handle_session(
                 }
             }
             _ => {
-                warn!("Controller mengirim perintah tanpa autentikasi!");
+                warn!("Client mengirim perintah tanpa autentikasi!");
                 let _ = stream.send_response(&CommandResponse::AuthFailed("Autentikasi dibutuhkan terlebih dahulu!".into())).await;
-                bail!("Controller tidak terautentikasi.");
+                bail!("Client tidak terautentikasi.");
             }
         }
     }
@@ -679,8 +673,8 @@ async fn handle_session(
                         channels.lock().await.remove(&channel_id);
                     }
 
-                    RemoteCommand::StartRemoteForward { bind_port, target_controller_port } => {
-                        info!("🔀 Membuka remote forward listener di port {} (target controller port {})", bind_port, target_controller_port);
+                    RemoteCommand::StartRemoteForward { bind_port, target_client_port } => {
+                        info!("🔀 Membuka remote forward listener di port {} (target client port {})", bind_port, target_client_port);
                         
                         let bind_res = match TcpListener::bind(format!("0.0.0.0:{}", bind_port)).await {
                             Ok(l) => Ok(l),
@@ -720,7 +714,7 @@ async fn handle_session(
                                                 };
 
                                                 let channel_id = REMOTE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                                info!("Koneksi remote baru di Agent port {} dari {}: channel_id={}", bind_port, client_addr, channel_id);
+                                                info!("Koneksi remote baru di Server port {} dari {}: channel_id={}", bind_port, client_addr, channel_id);
 
                                                 let (mut client_reader, mut client_writer) = client_stream.into_split();
                                                 let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(100);
@@ -728,7 +722,7 @@ async fn handle_session(
 
                                                 if outbound_tx_listener.send(CommandResponse::RemoteChannelOpened {
                                                     channel_id,
-                                                    target_port: target_controller_port,
+                                                    target_port: target_client_port,
                                                 }).await.is_err() {
                                                     break;
                                                 }

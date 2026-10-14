@@ -34,7 +34,7 @@ pub struct ClientArgs {
     pub privkey: Option<String>,
 
     /// Kunci publik statis milik Target Server (32-byte hex). Jika kosong, otomatis diambil via SSH-Style TOFU
-    #[arg(short = 'k', long = "server-pubkey", alias = "agent-pubkey")]
+    #[arg(short = 'k', long = "server-pubkey")]
     pub server_pubkey: Option<String>,
 
     /// Mode listen (Reverse Client) untuk menunggu Server yang menghubung balik
@@ -45,37 +45,35 @@ pub struct ClientArgs {
     pub command: Option<ClientCommand>,
 }
 
-pub type ControllerArgs = ClientArgs;
-
 #[derive(Subcommand, Debug, Clone)]
 pub enum ClientCommand {
     /// Masuk ke sesi interaktif remote shell (SSH-style REPL)
     Shell,
 
-    /// Menjalankan perintah terminal di Agent
+    /// Menjalankan perintah terminal di Server
     Exec {
         /// Perintah terminal yang ingin dieksekusi
         command: String,
     },
 
-    /// Mengambil metrik sistem dari Agent (CPU & RAM)
+    /// Mengambil metrik sistem dari Server (CPU & RAM)
     Stats,
 
-    /// Mengunggah file ke Agent dengan pembagian chunk
+    /// Mengunggah file ke Server dengan pembagian chunk
     Upload {
         /// Path file lokal yang akan diunggah
         filepath: PathBuf,
     },
 
-    /// Mengunduh file dari Agent ke Controller
+    /// Mengunduh file dari Server ke Client
     Download {
-        /// Path file di mesin Agent yang ingin diunduh
+        /// Path file di mesin Server yang ingin diunduh
         remote_path: String,
         /// Path file/folder lokal tujuan penyimpanan
         local_path: PathBuf,
     },
 
-    /// Mount filesystem remote Agent sebagai drive lokal (WebDAV virtual drive, default P:)
+    /// Mount filesystem remote Server sebagai drive lokal (WebDAV virtual drive, default P:)
     Mount {
         /// Huruf drive lokal di Windows (contoh: P: atau F:), default: P:
         #[arg(default_value = "P:")]
@@ -96,14 +94,14 @@ pub enum ClientCommand {
         mapping: String,
     },
 
-    /// Remote Port Forwarding (-R agent_bind_port:controller_target_port)
+    /// Remote Port Forwarding (-R server_bind_port:client_target_port)
     ForwardRemote {
-        /// Format forwarding misal 9090:8080 (agent_bind_port:controller_target_port)
+        /// Format forwarding misal 9090:8080 (server_bind_port:client_target_port)
         #[arg(short = 'R', long)]
         mapping: String,
     },
 
-    /// Kirim perintah shutdown ke Agent
+    /// Kirim perintah shutdown ke Server
     Shutdown,
 
     /// Buat pasangan kunci kriptografi Noise 25519 baru
@@ -139,7 +137,7 @@ async fn perform_upload(stream: &mut NoiseFramedStream, filepath: PathBuf) -> Re
     let ack = stream.recv_response().await?;
     match ack {
         CommandResponse::FileChunkAck { success: true, .. } => (),
-        _ => bail!("Agent menolak inisialisasi transfer file!"),
+        _ => bail!("Server menolak inisialisasi transfer file!"),
     }
 
     let mut chunk_buf = vec![0u8; CHUNK_SIZE];
@@ -163,7 +161,7 @@ async fn perform_upload(stream: &mut NoiseFramedStream, filepath: PathBuf) -> Re
         match res {
             CommandResponse::FileChunkAck { chunk_index, success } => {
                 if !success {
-                    bail!("Agent gagal menyimpan chunk {}", chunk_index);
+                    bail!("Server gagal menyimpan chunk {}", chunk_index);
                 }
             }
             _ => bail!("Respons tak terduga saat chunk ack: {:?}", res),
@@ -183,7 +181,7 @@ async fn perform_download(
     remote_path: String,
     local_path: PathBuf,
 ) -> Result<()> {
-    println!("📥 Meminta unduh file '{}' dari Agent...", remote_path);
+    println!("📥 Meminta unduh file '{}' dari Server...", remote_path);
     stream
         .send_command(&RemoteCommand::StartDownload {
             filepath: remote_path.clone(),
@@ -198,7 +196,7 @@ async fn perform_download(
             file_size,
         } => (filename, total_chunks, file_size),
         CommandResponse::DownloadError(err) => {
-            bail!("Agent menolak permintaan unduh: {}", err);
+            bail!("Server menolak permintaan unduh: {}", err);
         }
         other => bail!("Respons tak terduga saat inisiasi unduh: {:?}", other),
     };
@@ -270,7 +268,7 @@ async fn run_interactive_shell(stream: Arc<Mutex<NoiseFramedStream>>, addr: &str
     use std::io::{self, Write};
 
     println!("══════════════════════════════════════════════════════════");
-    println!("💻 SESI INTERAKTIF REMOTE SHELL (p controller)");
+    println!("💻 SESI INTERAKTIF REMOTE SHELL (p client)");
     println!("   Target Host : {}", addr);
     println!("   Bantuan     : Ketik 'help' untuk daftar perintah khusus");
     println!("   Keluar      : Ketik 'exit' atau tekan Ctrl+C");
@@ -312,15 +310,15 @@ async fn run_interactive_shell(stream: Arc<Mutex<NoiseFramedStream>>, addr: &str
 
         if trimmed == "help" {
             println!("📋 Perintah Bawaan:");
-            println!("   stats                      - Cek beban CPU & RAM di Agent");
-            println!("   upload <local_file>        - Unggah file lokal ke Agent");
-            println!("   download <remote> [local]  - Unduh file dari Agent ke lokal");
+            println!("   stats                      - Cek beban CPU & RAM di Server");
+            println!("   upload <local_file>        - Unggah file lokal ke Server");
+            println!("   download <remote> [local]  - Unduh file dari Server ke lokal");
             println!("   mount [drive]              - Mount remote files ke drive lokal (default P:)");
             println!("   unmount                    - Lepas mount drive lokal");
             println!("   rekey                      - Rotasi kunci sesi enkripsi Noise");
             println!("   clear / cls                - Bersihkan layar");
             println!("   exit / quit                - Keluar dari remote shell");
-            println!("💡 Semua perintah lainnya akan langsung dieksekusi di OS Agent.");
+            println!("💡 Semua perintah lainnya akan langsung dieksekusi di OS Server.");
             continue;
         }
 
@@ -487,8 +485,6 @@ async fn run_interactive_shell(stream: Arc<Mutex<NoiseFramedStream>>, addr: &str
 
     Ok(())
 }
-
-pub type ControllerCommand = ClientCommand;
 
 pub async fn run_client(args: ClientArgs) -> Result<()> {
     let client_privkey_bytes = match args.privkey {
@@ -669,22 +665,22 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
                     println!();
                 }
                 CommandResponse::AuthFailed(reason) => {
-                    bail!("❌ Autentikasi ditolak oleh Agent: {}", reason);
+                    bail!("❌ Autentikasi ditolak oleh Server: {}", reason);
                 }
                 other => bail!("Respons tak terduga saat autentikasi: {:?}", other),
             }
         }
-        other => bail!("Respons status awal tidak dikenal dari Agent: {:?}", other),
+        other => bail!("Respons status awal tidak dikenal dari Server: {:?}", other),
     }
 
-    let cmd = args.command.unwrap_or(ControllerCommand::Shell);
+    let cmd = args.command.unwrap_or(ClientCommand::Shell);
     match cmd {
-        ControllerCommand::Shell => {
+        ClientCommand::Shell => {
             let stream_arc = Arc::new(Mutex::new(stream));
             run_interactive_shell(stream_arc, &target_addr).await?;
         }
 
-        ControllerCommand::Exec { command } => {
+        ClientCommand::Exec { command } => {
             stream.send_command(&RemoteCommand::RunTerminal(command)).await?;
             let resp = stream.recv_response().await?;
             match resp {
@@ -697,7 +693,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
                     }
                 }
                 CommandResponse::ExecutionError(err) => {
-                    eprintln!("❌ Error eksekusi di Agent: {}", err);
+                    eprintln!("❌ Error eksekusi di Server: {}", err);
                 }
                 other => {
                     println!("Respons tak terduga: {:?}", other);
@@ -705,12 +701,12 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
             }
         }
 
-        ControllerCommand::Stats => {
+        ClientCommand::Stats => {
             stream.send_command(&RemoteCommand::GetSystemStats).await?;
             let resp = stream.recv_response().await?;
             match resp {
                 CommandResponse::SystemStats { cpu_usage, ram_used_mb } => {
-                    println!("📊 STATISTIK AGENT REMOTE:");
+                    println!("📊 STATISTIK SERVER REMOTE:");
                     println!("   Utilisasi CPU : {:.2}%", cpu_usage);
                     println!("   Penggunaan RAM: {} MB", ram_used_mb);
                 }
@@ -718,15 +714,15 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
             }
         }
 
-        ControllerCommand::Upload { filepath } => {
+        ClientCommand::Upload { filepath } => {
             perform_upload(&mut stream, filepath).await?;
         }
 
-        ControllerCommand::Download { remote_path, local_path } => {
+        ClientCommand::Download { remote_path, local_path } => {
             perform_download(&mut stream, remote_path, local_path).await?;
         }
 
-        ControllerCommand::Mount { drive, port } => {
+        ClientCommand::Mount { drive, port } => {
             let stream_arc = Arc::new(Mutex::new(stream));
             let (_server, actual_port) = crate::webdav::WebDavServer::start(stream_arc.clone(), port).await?;
             println!("🌐 WebDAV Virtual Drive Server aktif di http://127.0.0.1:{}/", actual_port);
@@ -757,7 +753,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
             #[cfg(not(target_os = "windows"))]
             {
                 println!("💡 Di Linux/macOS, pasang WebDAV menggunakan file manager Anda atau davfs2:");
-                println!("   mount -t davfs http://127.0.0.1:{}/ /mnt/agent", actual_port);
+                println!("   mount -t davfs http://127.0.0.1:{}/ /mnt/server", actual_port);
             }
 
             println!("🛑 Tekan Ctrl+C untuk melepas mount (unmount) dan keluar.");
@@ -771,7 +767,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
             }
         }
 
-        ControllerCommand::Rekey => {
+        ClientCommand::Rekey => {
             println!("🔄 Meminta rotasi kunci sesi...");
             stream.send_command(&RemoteCommand::RequestKeyRotation).await?;
             stream.rekey()?;
@@ -784,7 +780,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
             }
         }
 
-        ControllerCommand::ForwardLocal { mapping } => {
+        ClientCommand::ForwardLocal { mapping } => {
             let parts: Vec<&str> = mapping.split(':').collect();
             if parts.len() != 2 {
                 bail!("Format mapping harus berupa 'local_port:target_port', contoh: '8080:80'");
@@ -880,32 +876,32 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
             }
         }
 
-        ControllerCommand::ForwardRemote { mapping } => {
+        ClientCommand::ForwardRemote { mapping } => {
             let parts: Vec<&str> = mapping.split(':').collect();
             if parts.len() != 2 {
-                bail!("Format mapping harus berupa 'agent_port:controller_port', contoh: '9090:8080'");
+                bail!("Format mapping harus berupa 'server_port:client_port', contoh: '9090:8080'");
             }
-            let agent_port: u16 = parts[0].parse().context("Agent port tidak valid")?;
-            let controller_port: u16 = parts[1].parse().context("Controller target port tidak valid")?;
+            let server_port: u16 = parts[0].parse().context("Server port tidak valid")?;
+            let client_port: u16 = parts[1].parse().context("Client target port tidak valid")?;
 
-            println!("🔄 Meminta Agent membuka listener port {} untuk diteruskan ke Controller port {}...", agent_port, controller_port);
+            println!("🔄 Meminta Server membuka listener port {} untuk diteruskan ke Client port {}...", server_port, client_port);
 
             stream.send_command(&RemoteCommand::StartRemoteForward {
-                bind_port: agent_port,
-                target_controller_port: controller_port,
+                bind_port: server_port,
+                target_client_port: client_port,
             }).await?;
 
             let ack = stream.recv_response().await?;
             match ack {
                 CommandResponse::RemoteForwardAck { success, message, .. } => {
                     if !success {
-                        bail!("Agent menolak remote port forward: {}", message);
+                        bail!("Server menolak remote port forward: {}", message);
                     }
                     println!("✅ Remote Port Forwarding (-R) aktif!");
-                    println!("   Port di Agent        : 127.0.0.1:{}", agent_port);
-                    println!("   Aplikasi Controller  : 127.0.0.1:{}", controller_port);
+                    println!("   Port di Server       : 127.0.0.1:{}", server_port);
+                    println!("   Aplikasi Client      : 127.0.0.1:{}", client_port);
                     println!("   Info Listener        : {}", message);
-                    println!("   Klien di Agent dapat membuka http://127.0.0.1:{} untuk mengakses aplikasi lokal Controller.", agent_port);
+                    println!("   Klien di Server dapat membuka http://127.0.0.1:{} untuk mengakses aplikasi lokal Client.", server_port);
                 }
                 other => bail!("Respons tidak terduga saat inisiasi remote forward: {:?}", other),
             }
@@ -930,7 +926,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
 
                         match resp {
                             CommandResponse::RemoteChannelOpened { channel_id, target_port } => {
-                                info!("Koneksi masuk di Agent! Membuka koneksi lokal ke 127.0.0.1:{} (channel_id={})", target_port, channel_id);
+                                info!("Koneksi masuk di Server! Membuka koneksi lokal ke 127.0.0.1:{} (channel_id={})", target_port, channel_id);
                                 let outbound_tx_clone = outbound_tx.clone();
                                 let channels_clone = channels.clone();
 
@@ -966,7 +962,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
                                         });
                                     }
                                     Err(e) => {
-                                        warn!("Gagal membuka koneksi ke aplikasi Controller di port {}: {}", target_port, e);
+                                        warn!("Gagal membuka koneksi ke aplikasi Client di port {}: {}", target_port, e);
                                         let _ = outbound_tx.send(RemoteCommand::CloseForwardChannel { channel_id }).await;
                                     }
                                 }
@@ -982,7 +978,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
                             }
 
                             CommandResponse::RemoteChannelClosed { channel_id } => {
-                                info!("Remote channel {} ditutup oleh Agent", channel_id);
+                                info!("Remote channel {} ditutup oleh Server", channel_id);
                                 channels.lock().await.remove(&channel_id);
                             }
 
@@ -993,8 +989,8 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
             }
         }
 
-        ControllerCommand::Shutdown => {
-            println!("🛑 Mengirim sinyal Shutdown ke Agent...");
+        ClientCommand::Shutdown => {
+            println!("🛑 Mengirim sinyal Shutdown ke Server...");
             stream.send_command(&RemoteCommand::ShutdownDevice).await?;
             let resp = stream.recv_response().await?;
             match resp {
@@ -1013,9 +1009,4 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Alias backward compatibility untuk run_client
-pub async fn run_controller(args: ClientArgs) -> Result<()> {
-    run_client(args).await
 }

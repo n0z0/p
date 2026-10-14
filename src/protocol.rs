@@ -32,8 +32,8 @@ pub enum RemoteCommand {
     FsMkdir { path: String },
     FsRename { from: String, to: String },
 
-    // Remote Port Forwarding (-R: Agent Listener -> Controller Target)
-    StartRemoteForward { bind_port: u16, target_controller_port: u16 },
+    // Remote Port Forwarding (-R: Server Listener -> Client Target)
+    StartRemoteForward { bind_port: u16, target_client_port: u16 },
     StopRemoteForward { bind_port: u16 },
 }
 
