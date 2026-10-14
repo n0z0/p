@@ -1,9 +1,9 @@
 [package]
 name = "p"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 authors = ["Rolly Maulana Awangga <rolly@awang.ga>"]
-description = "Custom Lightweight Multiplatform Remote Control Agent & Controller"
+description = "Lightweight Multiplatform Remote Access Tool (SSH-like Server & Client)"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

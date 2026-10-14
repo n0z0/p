@@ -68,9 +68,9 @@ Dalam sistem `p`, komponen dibagi menjadi dua peran yang mengadopsi standar **SS
    * Seluruh lalu lintas data port forwarding menumpang di dalam satu koneksi Raw TCP Noise utama (Multiplexing) menggunakan identifikasi `channel_id`.
 
 6. **Manajemen Kunci Bergaya SSH (TOFU - Trust On First Use):**
-   * **Host Key Persisten:** Disimpan di `~/.p/agent.key` dan `~/.p/controller.key`.
-   * **Auto-Discovery Kunci Publik:** Client melakukan probe TOFU, memverifikasi Fingerprint (SHA-256), dan mencatatnya ke `~/.p/known_agents`.
-   * **Pairing Token:** Melindungi akses awal dengan token rahasia di `~/.p/agent.token` dan mencatat Client terotorisasi di `~/.p/authorized_controllers`.
+   * **Host Key Persisten:** Disimpan di `~/.p/server.key` dan `~/.p/client.key` (dengan fallback ke `agent.key`/`controller.key`).
+   * **Auto-Discovery Kunci Publik:** Client melakukan probe TOFU, memverifikasi Fingerprint (SHA-256), dan mencatatnya ke `~/.p/known_servers` (seperti `known_hosts`).
+   * **Pairing Token & Nickname:** Melindungi akses awal dengan token rahasia di `~/.p/server.token` dan mencatat Client terotorisasi di `~/.p/authorized_clients` (seperti `authorized_keys`).
 
 ---
 

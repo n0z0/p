@@ -2,9 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
-use p::agent::{run_agent, AgentArgs};
-use p::controller::{run_controller, ControllerArgs, ControllerCommand};
+use p::client::{run_client, ClientArgs, ClientCommand};
 use p::crypto::generate_keypair;
+use p::server::{run_server, ServerArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,8 +37,8 @@ struct Cli {
     pub privkey: Option<String>,
 
     /// Kunci publik milik target Server (32-byte hex)
-    #[arg(short = 'k', long)]
-    pub agent_pubkey: Option<String>,
+    #[arg(short = 'k', long = "server-pubkey", alias = "agent-pubkey")]
+    pub server_pubkey: Option<String>,
 
     /// Folder penyimpanan file yang diterima (Server)
     #[arg(long, default_value = "./storage")]
@@ -59,7 +59,7 @@ struct Cli {
     pub forward_remote: Option<String>,
 
     #[command(subcommand)]
-    pub command: Option<ControllerCommand>,
+    pub command: Option<ClientCommand>,
 }
 
 #[tokio::main]
@@ -69,49 +69,49 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 1. Cek apakah pengguna memanggil keygen: `p keygen`
-    if cli.target.as_deref() == Some("keygen") || matches!(cli.command, Some(ControllerCommand::Keygen)) {
+    if cli.target.as_deref() == Some("keygen") || matches!(cli.command, Some(ClientCommand::Keygen)) {
         let keypair = generate_keypair()?;
         println!("🔑 PASANGAN KUNCI BARU (25519):");
         println!("   Public Key : {}", hex::encode(&keypair.public));
         println!("   Private Key: {}", hex::encode(&keypair.private));
-        println!("\n💡 Gunakan Public Key pada Controller (-k) dan Private Key pada Agent (--privkey).");
+        println!("\n💡 Gunakan Public Key pada Client (-k) dan Private Key pada Server (--privkey).");
         return Ok(());
     }
 
     // Resolusi command port forwarding dari flag -L / -R
     let command = if let Some(mapping) = cli.forward_local {
-        Some(ControllerCommand::ForwardLocal { mapping })
+        Some(ClientCommand::ForwardLocal { mapping })
     } else if let Some(mapping) = cli.forward_remote {
-        Some(ControllerCommand::ForwardRemote { mapping })
+        Some(ClientCommand::ForwardRemote { mapping })
     } else {
         cli.command
     };
 
-    // 2. Tentukan peran: Controller vs Agent
-    // - Jika flag -r aktif dan ada target -> Agent connecting reverse to Controller
-    // - Jika flag -r aktif tanpa target -> Controller listening for reverse Agent
-    // - Jika normal dan ada target / command -> Controller connecting to Agent
-    // - Jika normal tanpa target -> Agent listening
-    let is_controller = if cli.reverse {
-        cli.target.is_none() // Jika tanpa target, Controller yang listen
+    // 2. Tentukan peran: Client vs Server
+    // - Jika flag -r aktif dan ada target -> Server connecting reverse to Client
+    // - Jika flag -r aktif tanpa target -> Client listening for reverse Server
+    // - Jika normal dan ada target / command -> Client connecting to Server
+    // - Jika normal tanpa target -> Server listening
+    let is_client = if cli.reverse {
+        cli.target.is_none() // Jika tanpa target, Client yang listen
     } else {
         cli.target.is_some() || command.is_some()
     };
 
-    if is_controller {
+    if is_client {
         let addr = cli.addr.or_else(|| cli.port.map(|p| format!("0.0.0.0:{}", p)));
-        let args = ControllerArgs {
+        let args = ClientArgs {
             addr_pos: cli.target,
             addr,
             token: cli.token,
             privkey: cli.privkey,
-            agent_pubkey: cli.agent_pubkey,
+            server_pubkey: cli.server_pubkey,
             reverse: cli.reverse,
             command,
         };
-        run_controller(args).await
+        run_client(args).await
     } else {
-        // Mode Agent (Server Daemon)
+        // Mode Server (Daemon Pelayan)
         let mode = if cli.reverse && cli.target.is_some() {
             "connect".to_string() // Reverse connection outbound
         } else {
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
             "0.0.0.0:9999".into()
         };
 
-        let args = AgentArgs {
+        let args = ServerArgs {
             mode,
             addr,
             privkey: cli.privkey,
@@ -137,6 +137,6 @@ async fn main() -> Result<()> {
             key_rotation_secs: 3600,
             key_rotation_bytes: 1_073_741_824,
         };
-        run_agent(args).await
+        run_server(args).await
     }
 }

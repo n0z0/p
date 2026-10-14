@@ -45,7 +45,7 @@ p -p 8080
 
 > **Catatan Multi-Client & Keamanan:**
 > * **Multi-Client:** Server otomatis melayani banyak Client secara bersamaan (*concurrent*). Tiap koneksi Client diisolasi dalam thread async (`tokio::spawn`) dengan kunci sesi enkripsinya masing-masing.
-> * **Pairing Token:** Saat pertama kali dijalankan, Server membuat kunci host di `~/.p/agent.key` dan menampilkan **Pairing Token** (password otorisasi) untuk Client pertama kali.
+> * **Pairing Token:** Saat pertama kali dijalankan, Server membuat kunci host di `~/.p/server.key` dan menampilkan **Pairing Token** (password otorisasi) untuk Client pertama kali.
 
 ---
 
@@ -62,7 +62,8 @@ p 1.2.3.4:9999
 🔒 KUNCI PUBLIK SERVER TERVERIFIKASI: SHA256:4b...
 🔒 Server membutuhkan otorisasi untuk Client baru.
 🔑 Masukkan Password / Pairing Token: ********
-✅ Pairing berhasil! Kunci Client telah diotorisasi di Server (~/.p/authorized_controllers).
+🏷️  Nama Perangkat / Nickname [joe@LAPTOP-THINKPAD]: 
+✅ Pairing berhasil! Kunci Client telah diotorisasi di Server (~/.p/authorized_clients).
 
 ══════════════════════════════════════════════════════════
 💻 SESI INTERAKTIF REMOTE SHELL (p)
@@ -80,7 +81,7 @@ p[1.2.3.4:9999]> mount P:
 p[1.2.3.4:9999]> exit
 ```
 
-> **Zero-Friction:** Pada koneksi berikutnya, Client langsung terhubung tanpa perlu memasukkan token lagi karena kunci Client telah terdaftar di whitelist `~/.p/authorized_controllers` Server.
+> **Zero-Friction:** Pada koneksi berikutnya, Client langsung terhubung tanpa perlu memasukkan token lagi karena kunci Client telah terdaftar di whitelist `~/.p/authorized_clients` Server.
 
 ---
 

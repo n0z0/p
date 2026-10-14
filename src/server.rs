@@ -11,16 +11,16 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
 use crate::crypto::{
-    add_authorized_controller, compute_key_fingerprint, is_controller_authorized,
-    load_or_create_agent_key, load_or_create_agent_token,
+    add_authorized_client, compute_key_fingerprint, is_client_authorized,
+    load_or_create_server_key, load_or_create_server_token,
 };
 use crate::framed::NoiseFramedStream;
 use crate::os::{execute_os_command, get_system_stats, shutdown_system};
 use crate::protocol::{CommandResponse, RemoteCommand};
 
 #[derive(Args, Debug, Clone)]
-pub struct AgentArgs {
-    /// Mode operasi: 'listen' untuk menunggu Controller atau 'connect' untuk reverse-connection ke Controller
+pub struct ServerArgs {
+    /// Mode operasi: 'listen' untuk menunggu Client atau 'connect' untuk reverse-connection ke Client
     #[arg(short, long, default_value = "listen")]
     pub mode: String,
 
@@ -28,11 +28,11 @@ pub struct AgentArgs {
     #[arg(short, long, default_value = "0.0.0.0:9999")]
     pub addr: String,
 
-    /// Kunci privat statis dalam format heksadesimal (32-byte). Jika kosong, kunci persisten ~/.p/agent.key akan digunakan
+    /// Kunci privat statis dalam format heksadesimal (32-byte). Jika kosong, kunci persisten ~/.p/server.key akan digunakan
     #[arg(short, long)]
     pub privkey: Option<String>,
 
-    /// Token rahasia / Password untuk otorisasi Controller (pairing pertama kali)
+    /// Token rahasia / Password untuk otorisasi Client (pairing pertama kali)
     #[arg(short, long)]
     pub token: Option<String>,
 
@@ -49,6 +49,8 @@ pub struct AgentArgs {
     pub key_rotation_bytes: u64,
 }
 
+pub type AgentArgs = ServerArgs;
+
 struct FileTransferState {
     filename: String,
     total_chunks: u32,
@@ -56,7 +58,7 @@ struct FileTransferState {
     file: File,
 }
 
-pub async fn run_agent(args: AgentArgs) -> Result<()> {
+pub async fn run_server(args: ServerArgs) -> Result<()> {
     tokio::fs::create_dir_all(&args.storage_dir)
         .await
         .context("Gagal membuat direktori storage")?;
@@ -70,12 +72,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
             (bytes, Vec::new())
         }
         None => {
-            let keypair = load_or_create_agent_key().context("Gagal memuat atau membuat kunci host persisten")?;
+            let keypair = load_or_create_server_key().context("Gagal memuat atau membuat kunci host persisten")?;
             let fingerprint = compute_key_fingerprint(&keypair.public);
-            println!("🔑 Kunci Host Agent Persisten (~/.p/agent.key):");
+            println!("🔑 Kunci Host Server Persisten (~/.p/server.key):");
             println!("   Public Key  : {}", hex::encode(&keypair.public));
             println!("   Fingerprint : {}", fingerprint);
-            println!("   SSH-Style   : Controller dapat otomatis mendeteksi & menyimpan kunci ini (TOFU)!");
+            println!("   SSH-Style   : Client dapat otomatis mendeteksi & menyimpan kunci ini (TOFU)!");
             println!();
             (keypair.private, keypair.public)
         }
@@ -83,12 +85,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
 
     let pairing_token = match &args.token {
         Some(t) => t.trim().to_string(),
-        None => load_or_create_agent_token(),
+        None => load_or_create_server_token(),
     };
-    println!("🔐 AGENT PAIRING TOKEN (Password Otorisasi Controller):");
+    println!("🔐 SERVER PAIRING TOKEN (Password Otorisasi Client):");
     println!("   Token       : {}", pairing_token);
-    println!("   Petunjuk    : Masukkan token ini ketika Controller pertama kali menghubung!");
-    println!("   Keamanan    : Controller yang berhasil pairing dicatat di ~/.p/authorized_controllers");
+    println!("   Petunjuk    : Masukkan token ini ketika Client pertama kali menghubung!");
+    println!("   Keamanan    : Client yang berhasil pairing dicatat di ~/.p/authorized_clients");
     println!();
     let pairing_token = Arc::new(pairing_token);
 
@@ -107,8 +109,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
     Ok(())
 }
 
+pub async fn run_agent(args: ServerArgs) -> Result<()> {
+    run_server(args).await
+}
+
 async fn run_listen_loop(
-    args: &AgentArgs,
+    args: &ServerArgs,
     privkey: &[u8],
     pubkey: &[u8],
     pairing_token: Arc<String>,
@@ -117,7 +123,7 @@ async fn run_listen_loop(
         .await
         .with_context(|| format!("Gagal bind ke {}", args.addr))?;
 
-    info!("🚀 Remote Agent aktif dalam mode LISTEN di {}", args.addr);
+    info!("🚀 Remote Server aktif dalam mode LISTEN di {}", args.addr);
 
     loop {
         match listener.accept().await {
@@ -153,7 +159,7 @@ async fn run_listen_loop(
 }
 
 async fn run_reconnect_loop(
-    args: &AgentArgs,
+    args: &ServerArgs,
     privkey: &[u8],
     pubkey: &[u8],
     pairing_token: Arc<String>,
@@ -162,7 +168,7 @@ async fn run_reconnect_loop(
     let max_backoff = 60u64;
 
     loop {
-        info!("🔄 Menghubungi Controller di {} ...", args.addr);
+        info!("🔄 Menghubungi Client di {} ...", args.addr);
         match TcpStream::connect(&args.addr).await {
             Ok(stream) => {
                 info!("🌐 Koneksi TCP terbuka ke {}. Memulai Noise handshake...", args.addr);
@@ -214,10 +220,10 @@ async fn handle_session(
     key_rotation_bytes: u64,
     pairing_token: Arc<String>,
 ) -> Result<()> {
-    // 1. Verifikasi Otorisasi Controller
+    // 1. Verifikasi Otorisasi Client
     let remote_pubkey_opt = stream.get_remote_static().map(|k| k.to_vec());
     let is_authorized = match &remote_pubkey_opt {
-        Some(k) => is_controller_authorized(k),
+        Some(k) => is_client_authorized(k),
         None => false,
     };
 
@@ -252,12 +258,12 @@ async fn handle_session(
                         }
                     });
                     if let Some(ref k) = remote_pubkey_opt {
-                        if let Err(e) = add_authorized_controller(k, Some(&client_label)) {
-                            warn!("Gagal menyimpan authorized_controller: {}", e);
+                        if let Err(e) = add_authorized_client(k, Some(&client_label)) {
+                            warn!("Gagal menyimpan authorized_client: {}", e);
                         }
                     }
                     info!(
-                        "✅ Pairing Client berhasil! Public key ({}) [{}] disimpan ke ~/.p/authorized_controllers",
+                        "✅ Pairing Client berhasil! Public key ({}) [{}] disimpan ke ~/.p/authorized_clients",
                         client_fingerprint, client_label
                     );
                     stream.send_response(&CommandResponse::AuthSuccess).await?;
